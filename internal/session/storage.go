@@ -20,7 +20,6 @@ func StorageFile() string {
 
 // Settings represents user preferences
 type Settings struct {
-	PreferredTerminal    string   `json:"preferred_terminal"`             // "Auto", "iTerm2", "Ghostty", "Kitty", "Terminal"
 	ActiveExpanded       *bool    `json:"active_expanded,omitempty"`      // Active group expanded state
 	InactiveExpanded     *bool    `json:"inactive_expanded,omitempty"`    // Inactive group expanded state
 	Theme                string   `json:"theme,omitempty"`                // Color theme name
@@ -41,7 +40,7 @@ func LoadStorage() (*StorageData, error) {
 	data := &StorageData{
 		Sessions: make([]*Session, 0),
 		Groups:   make([]*Group, 0),
-		Settings: &Settings{PreferredTerminal: "Auto"},
+		Settings: &Settings{},
 	}
 
 	file := StorageFile()
@@ -59,7 +58,7 @@ func LoadStorage() (*StorageData, error) {
 
 	// Ensure settings exists
 	if data.Settings == nil {
-		data.Settings = &Settings{PreferredTerminal: "Auto"}
+		data.Settings = &Settings{}
 	}
 
 	return data, nil
@@ -235,27 +234,10 @@ func (m *Manager) Save() error {
 	return SaveStorage(data)
 }
 
-// GetPreferredTerminal returns the preferred terminal setting
-func (m *Manager) GetPreferredTerminal() string {
-	if m.Settings == nil {
-		return "Auto"
-	}
-	return m.Settings.PreferredTerminal
-}
-
-// SetPreferredTerminal updates the preferred terminal setting
-func (m *Manager) SetPreferredTerminal(terminal string) error {
-	if m.Settings == nil {
-		m.Settings = &Settings{}
-	}
-	m.Settings.PreferredTerminal = terminal
-	return m.Save()
-}
-
 // GetTheme returns the theme setting
 func (m *Manager) GetTheme() string {
 	if m.Settings == nil || m.Settings.Theme == "" {
-		return "Catppuccin Mocha"
+		return "Dracula"
 	}
 	return m.Settings.Theme
 }
@@ -421,13 +403,20 @@ func (m *Manager) FindGroup(id string) *Group {
 }
 
 // RenameSession updates a session's name
+// If name is empty, resets to dynamic naming (from tab title)
 func (m *Manager) RenameSession(id, name string) error {
 	s := m.FindSession(id)
 	if s == nil {
 		return nil
 	}
-	s.Name = name
-	s.Renamed = true // Mark as manually renamed so tab title sync doesn't override
+	if name == "" {
+		// Reset to dynamic naming
+		s.Renamed = false
+		// Name will be updated by next status refresh from tab title
+	} else {
+		s.Name = name
+		s.Renamed = true // Mark as manually renamed so tab title sync doesn't override
+	}
 	return m.Save()
 }
 

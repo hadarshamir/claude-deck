@@ -54,11 +54,9 @@ type App struct {
 	contentHeight int
 	listStartY    int // Y offset where list content starts (for mouse)
 
-	watcher      *fsnotify.Watcher
-	showHelp     bool // true when help overlay is visible
-	showTerminal bool // true when terminal selection overlay is visible
-	terminalCursor int // cursor position in terminal selection
-	showTheme    bool // true when theme selection overlay is visible
+	watcher   *fsnotify.Watcher
+	showHelp  bool // true when help overlay is visible
+	showTheme bool // true when theme selection overlay is visible
 	themeCursor  int  // cursor position in theme selection
 
 	// New session dialog
@@ -346,10 +344,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.list.ReloadExpansionState()
 		a.list.Refresh()
-		// Apply terminal preference from settings
-		if pref := a.manager.GetPreferredTerminal(); pref != "" {
-			terminal.SetPreferredTerminal(terminal.ParseTerminal(pref))
-		}
 		// Apply theme from settings
 		if theme := a.manager.GetTheme(); theme != "" {
 			ApplyTheme(theme)
@@ -463,33 +457,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Any key closes help
 			if msg.String() == "esc" || msg.String() == "h" || msg.String() == "enter" || msg.String() == "Q" {
 				a.showHelp = false
-			}
-		}
-		return a, nil
-	}
-
-	// Handle terminal selection overlay
-	if a.showTerminal {
-		if msg, ok := msg.(tea.KeyMsg); ok {
-			allTerminals := terminal.AllTerminals()
-			switch msg.String() {
-			case "esc", "Q":
-				a.showTerminal = false
-			case "enter":
-				// Apply selection
-				selected := allTerminals[a.terminalCursor]
-				a.manager.SetPreferredTerminal(selected.String())
-				terminal.SetPreferredTerminal(selected)
-				a.showTerminal = false
-				return a, a.setStatus("Terminal set to " + selected.String())
-			case "up":
-				if a.terminalCursor > 0 {
-					a.terminalCursor--
-				}
-			case "down":
-				if a.terminalCursor < len(allTerminals)-1 {
-					a.terminalCursor++
-				}
 			}
 		}
 		return a, nil
@@ -646,6 +613,12 @@ func (a *App) handleDialogConfirm() (tea.Model, tea.Cmd) {
 	case DialogRename:
 		if name := a.dialog.Value(); name != "" {
 			a.manager.RenameSession(a.dialog.TargetID(), name)
+			// Update kitty tab title if session has active window
+			if s := a.manager.FindSession(a.dialog.TargetID()); s != nil {
+				if windowID := session.GetActiveWindowID(s); windowID > 0 {
+					terminal.SetKittyTabTitle(windowID, name)
+				}
+			}
 			a.list.Refresh()
 			a.dialog.Close()
 			return a, a.setStatus("Session renamed")
@@ -770,13 +743,29 @@ func (a *App) updateRename(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "enter":
 			id, newName, isGroup := a.list.ConfirmRename()
-			if id != "" && newName != "" {
+			if id != "" {
 				if isGroup {
-					a.manager.RenameGroup(id, newName)
+					if newName != "" {
+						a.manager.RenameGroup(id, newName)
+					}
 				} else {
-					a.manager.RenameSession(id, newName)
+					a.manager.RenameSession(id, newName) // empty name resets to dynamic
+					// Update kitty tab title if session has active window
+					if s := a.manager.FindSession(id); s != nil {
+						if windowID := session.GetActiveWindowID(s); windowID > 0 {
+							if newName != "" {
+								terminal.SetKittyTabTitle(windowID, newName)
+							} else {
+								// Reset to dynamic window title
+								terminal.ResetKittyTabTitle(windowID)
+							}
+						}
+					}
 				}
 				a.list.Refresh()
+				if newName == "" {
+					return a, a.setStatus("Reset to dynamic name")
+				}
 				return a, a.setStatus("Renamed")
 			}
 			return a, nil
@@ -977,18 +966,6 @@ func (a *App) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return a, a.setStatus("Horizontal layout")
 			}
 
-		case key.Matches(msg, a.keys.Terminal):
-			a.showTerminal = true
-			// Set cursor to current selection
-			currentPref := terminal.GetPreferredTerminal()
-			for i, t := range terminal.AllTerminals() {
-				if t == currentPref {
-					a.terminalCursor = i
-					break
-				}
-			}
-			return a, nil
-
 		case key.Matches(msg, a.keys.Theme):
 			a.showTheme = true
 			// Set cursor to current theme
@@ -1129,12 +1106,10 @@ func (a *App) View() string {
 	}
 
 	if a.loading {
-		// Show loading screen with spinner, centered if we have dimensions
-		loadingText := titleStyle.Render("Claude Deck") + "\n\n  ⏳ Loading sessions..."
+		// Show loading screen with spinner, centered
+		loadingText := titleStyle.Render("Claude Deck") + "\n\n⏳ Loading sessions..."
 		if a.width > 0 && a.height > 0 {
-			// Center vertically
-			padding := a.height / 3
-			return strings.Repeat("\n", padding) + loadingText
+			return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, loadingText)
 		}
 		return loadingText
 	}
@@ -1197,7 +1172,7 @@ func (a *App) View() string {
 	}
 
 	// Status bar - help on left, messages on right
-	helpText := "Enter:open  /,?:search  R:rename  K:kill  P:pin  S:resume  H:help  Q:quit"
+	helpText := "Enter:open  N:new  /,?:search  R:rename  K:kill  P:pin  H:help  Q:quit"
 	var statusLine string
 	if a.statusMsg != "" {
 		gap := a.width - len(helpText) - len(a.statusMsg) - 4
@@ -1231,9 +1206,6 @@ func (a *App) View() string {
 	// Show overlays as full screen replacement when active
 	if a.showHelp {
 		return a.renderHelp()
-	}
-	if a.showTerminal {
-		return a.renderTerminalSelect()
 	}
 	if a.showTheme {
 		return a.renderThemeSelect()
@@ -1342,7 +1314,6 @@ func (a *App) renderHelp() string {
 │                                       │
 │  Settings                             │
 │    L        Toggle layout (|| / =)    │
-│    T        Select terminal emulator  │
 │    C        Select color theme        │
 │    S        Toggle resume on startup  │
 │                                       │
@@ -1357,71 +1328,54 @@ func (a *App) renderHelp() string {
 	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, helpBox)
 }
 
-// renderTerminalSelect renders a centered terminal selection screen
-func (a *App) renderTerminalSelect() string {
-	allTerminals := terminal.AllTerminals()
-	currentPref := terminal.GetPreferredTerminal()
-
-	// Build option lines - inner width is 29 chars (31 total with │ on each side)
-	var optionLines []string
-	for i, t := range allTerminals {
-		cursor := "  "
-		if i == a.terminalCursor {
-			cursor = "> "
-		}
-		name := t.String()
-		if t == currentPref {
-			name += " (current)"
-		}
-		// Format: space + cursor(2) + name, padded to 29 total inner
-		line := " " + cursor + name
-		for len(line) < 29 {
-			line += " "
-		}
-		optionLines = append(optionLines, "│"+line+"│")
-	}
-
-	box := "╭─────────────────────────────╮\n" +
-		"│      Select Terminal        │\n" +
-		"├─────────────────────────────┤\n" +
-		strings.Join(optionLines, "\n") + "\n" +
-		"│                             │\n" +
-		"│  ↑↓:navigate  Enter:select  │\n" +
-		"│         Esc:cancel          │\n" +
-		"╰─────────────────────────────╯"
-
-	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, box)
-}
-
 func (a *App) renderThemeSelect() string {
-	// Build option lines - inner width is 29 chars (31 total with │ on each side)
-	var optionLines []string
+	const innerWidth = 32
+	var lines []string
+
+	lines = append(lines, "╭────────────────────────────────╮")
+	lines = append(lines, "│         Select Theme           │")
+	lines = append(lines, "├────────────────────────────────┤")
+
+	// Theme options
 	for i, name := range ThemeNames {
+		isSelected := i == a.themeCursor
+		isCurrent := name == CurrentThemeName
+
 		cursor := "  "
-		if i == a.themeCursor {
+		if isSelected {
 			cursor = "> "
 		}
-		displayName := name
-		if name == CurrentThemeName {
-			displayName += " ✓"
+		check := "  "
+		if isCurrent {
+			check = " ✓"
 		}
-		// Format: space + cursor(2) + name, padded to 29 total inner
-		line := " " + cursor + displayName
-		for len(line) < 29 {
-			line += " "
+
+		// Build line content: cursor(2) + name + padding + check(2) = 32
+		padLen := innerWidth - 2 - len(name) - 2
+		if padLen < 0 {
+			padLen = 0
 		}
-		optionLines = append(optionLines, "│"+line+"│")
+		content := cursor + name + strings.Repeat(" ", padLen) + check
+
+		if isSelected {
+			// Preview the theme's colors on hover
+			if theme, ok := Themes[name]; ok {
+				previewStyle := lipgloss.NewStyle().
+					Background(theme.Surface).
+					Foreground(theme.Primary).
+					Bold(true).
+					Width(innerWidth)
+				content = previewStyle.Render(content)
+			}
+		}
+		lines = append(lines, "│"+content+"│")
 	}
 
-	box := "╭─────────────────────────────╮\n" +
-		"│        Select Theme         │\n" +
-		"├─────────────────────────────┤\n" +
-		strings.Join(optionLines, "\n") + "\n" +
-		"│                             │\n" +
-		"│  ↑↓:navigate  Enter:select  │\n" +
-		"│         Esc:cancel          │\n" +
-		"╰─────────────────────────────╯"
+	lines = append(lines, "├────────────────────────────────┤")
+	lines = append(lines, "│ ↑↓:navigate Enter:ok Esc:cancel│")
+	lines = append(lines, "╰────────────────────────────────╯")
 
+	box := strings.Join(lines, "\n")
 	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, box)
 }
 

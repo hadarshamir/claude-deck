@@ -16,28 +16,19 @@ const (
 	DialogRenameGroup
 	DialogDelete
 	DialogMove
-	DialogTerminal
 )
-
-// TerminalOption represents a terminal choice
-type TerminalOption struct {
-	Name   string
-	Active bool // true if this is the currently selected terminal
-}
 
 // DialogModel manages modal dialogs
 type DialogModel struct {
-	dialogType     DialogType
-	input          textinput.Model
-	title          string
-	message        string
-	targetID       string
-	targetName     string
-	confirmFocus   bool
-	groups         []GroupOption
-	groupCursor    int
-	terminals      []TerminalOption
-	terminalCursor int
+	dialogType   DialogType
+	input        textinput.Model
+	title        string
+	message      string
+	targetID     string
+	targetName   string
+	confirmFocus bool
+	groups       []GroupOption
+	groupCursor  int
 }
 
 // GroupOption represents a group choice in the move dialog
@@ -108,29 +99,6 @@ func (m *DialogModel) OpenMove(id, name string, groups []GroupOption) {
 	m.groupCursor = 0
 }
 
-// OpenTerminal opens the terminal selection dialog
-func (m *DialogModel) OpenTerminal(terminals []TerminalOption) {
-	m.dialogType = DialogTerminal
-	m.title = "Select Terminal"
-	m.terminals = terminals
-	m.terminalCursor = 0
-	// Set cursor to currently active terminal
-	for i, t := range terminals {
-		if t.Active {
-			m.terminalCursor = i
-			break
-		}
-	}
-}
-
-// SelectedTerminal returns the selected terminal name
-func (m *DialogModel) SelectedTerminal() string {
-	if m.dialogType != DialogTerminal || len(m.terminals) == 0 {
-		return ""
-	}
-	return m.terminals[m.terminalCursor].Name
-}
-
 // Close closes the dialog
 func (m *DialogModel) Close() {
 	m.dialogType = DialogNone
@@ -197,17 +165,11 @@ func (m *DialogModel) Update(msg tea.Msg) (*DialogModel, tea.Cmd) {
 			if m.dialogType == DialogMove && m.groupCursor > 0 {
 				m.groupCursor--
 			}
-			if m.dialogType == DialogTerminal && m.terminalCursor > 0 {
-				m.terminalCursor--
-			}
 			return m, nil
 
 		case "down":
 			if m.dialogType == DialogMove && m.groupCursor < len(m.groups)-1 {
 				m.groupCursor++
-			}
-			if m.dialogType == DialogTerminal && m.terminalCursor < len(m.terminals)-1 {
-				m.terminalCursor++
 			}
 			return m, nil
 		}
@@ -238,8 +200,6 @@ func (m *DialogModel) View() string {
 		content = m.renderDeleteDialog()
 	case DialogMove:
 		content = m.renderMoveDialog()
-	case DialogTerminal:
-		content = m.renderTerminalDialog()
 	}
 
 	return dialogStyle.Render(content)
@@ -293,29 +253,4 @@ func (m *DialogModel) renderMoveDialog() string {
 	hint := helpStyle.Render("j/k to navigate • Enter to move • Esc to cancel")
 
 	return lipgloss.JoinVertical(lipgloss.Center, title, "", groupList, "", hint)
-}
-
-// renderTerminalDialog renders the terminal selection dialog
-func (m *DialogModel) renderTerminalDialog() string {
-	title := dialogTitleStyle.Render(m.title)
-
-	var terminalLines []string
-	for i, t := range m.terminals {
-		cursor := "  "
-		style := itemStyle
-		if i == m.terminalCursor {
-			cursor = "> "
-			style = selectedItemStyle
-		}
-		name := t.Name
-		if t.Active {
-			name += " (current)"
-		}
-		terminalLines = append(terminalLines, cursor+style.Render(name))
-	}
-
-	terminalList := lipgloss.JoinVertical(lipgloss.Left, terminalLines...)
-	hint := helpStyle.Render("j/k to navigate • Enter to select • Esc to cancel")
-
-	return lipgloss.JoinVertical(lipgloss.Center, title, "", terminalList, "", hint)
 }

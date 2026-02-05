@@ -848,15 +848,7 @@ func padStr(s string, width int) string {
 
 // renderRow renders a single row in table format - MUST NOT exceed width
 func (m *ListModel) renderRow(item ListItem, selected, hovered bool, nameW, dateW int) string {
-	var style lipgloss.Style
-
-	if selected {
-		style = selectedItemStyle
-	} else if hovered {
-		style = hoverItemStyle
-	} else {
-		style = itemStyle
-	}
+	totalWidth := nameW + dateW + 6 // prefix(~4) + separator(3)
 
 	if item.IsGroup() {
 		arrow := "▶"
@@ -864,39 +856,32 @@ func (m *ListModel) renderRow(item ListItem, selected, hovered bool, nameW, date
 			arrow = "▼"
 		}
 		name := truncate(item.Group.Name, nameW)
-		if selected {
-			style = selectedGroupStyle
-		} else {
-			style = groupStyle
-		}
+
+		var row string
 		// Show rename input if renaming this group
 		if selected && m.renaming {
 			nameWithCursor := m.renameInput[:m.renameCursor] + "_" + m.renameInput[m.renameCursor:]
-			return " " + arrow + " " + style.Render(padStr(nameWithCursor, nameW))
-		}
-		// Show delete confirmation for group - X replaces arrow
-		if selected && m.deleting {
+			row = " " + arrow + " " + padStr(nameWithCursor, nameW)
+		} else if selected && m.deleting {
+			// Show delete confirmation for group - X replaces arrow
 			prompt := "Delete group? (y/n)"
-			return " X " + style.Render(padStr(prompt, nameW))
+			row = " X " + padStr(prompt, nameW)
+		} else {
+			row = " " + arrow + " " + name
 		}
-		return " " + arrow + " " + style.Render(name)
+
+		// Apply style to entire row
+		if selected {
+			return selectedGroupStyle.Width(totalWidth).Render(row)
+		}
+		return groupStyle.Render(row)
 	}
 
 	// Session row
 	s := item.Session
 
-	// Pin indicator (✦ or space) - 1 char
-	pinSym := " "
-	if s.Pinned {
-		pinSym = selectedItemStyle.Render("✦")
-	}
-
-	// Status symbol (all 1 char: ●, ◐, ○)
-	statusSym := StatusStyle(s.Status.String()).Render(s.Status.Symbol())
-
-	// Tree prefix for items in groups - calculate early for all row types
+	// Tree prefix for items in groups
 	treePrefix := ""
-	rowPrefix := pinSym + statusSym + " "
 	prefixExtra := 0
 	if item.Indent > 0 {
 		if item.IsLastInTree {
@@ -904,44 +889,91 @@ func (m *ListModel) renderRow(item ListItem, selected, hovered bool, nameW, date
 		} else {
 			treePrefix = "├"
 		}
-		rowPrefix = " " + treePrefix + pinSym + statusSym + " "
 		prefixExtra = 2
 	}
 
 	// Effective name width (smaller when tree prefix present)
 	effectiveNameW := nameW - prefixExtra
 
-	// Show rename input if renaming - simple underscore cursor like vim
+	// Build name/date content
+	var nameText string
+	showDeleteX := false
 	if selected && m.renaming {
 		nameWithCursor := m.renameInput[:m.renameCursor] + "_" + m.renameInput[m.renameCursor:]
-		nameText := padStr(nameWithCursor, effectiveNameW)
-		dateText := padStr(s.LastAccessedAt.Format("Jan 2 15:04"), dateW)
-		return rowPrefix + style.Render(nameText+" │ "+dateText)
-	}
-
-	// Show delete confirmation in-line - X replaces status symbol
-	if selected && m.deleting {
-		prompt := "Delete? (y/n)"
-		nameText := padStr(prompt, effectiveNameW)
-		dateText := padStr(s.LastAccessedAt.Format("Jan 2 15:04"), dateW)
-		if treePrefix != "" {
-			return " " + treePrefix + " X " + style.Render(nameText+" │ "+dateText)
+		nameText = padStr(nameWithCursor, effectiveNameW)
+	} else if selected && m.deleting {
+		nameText = padStr("Delete? (y/n)", effectiveNameW)
+		showDeleteX = true
+	} else {
+		name := s.Name
+		if name == "" {
+			name = s.FolderName()
 		}
-		return " X " + style.Render(nameText+" │ "+dateText)
+		nameText = padStr(name, effectiveNameW)
 	}
-
-	// Use session Name (set by user rename, or default from discovery)
-	name := s.Name
-	if name == "" {
-		name = s.FolderName()
-	}
-
-	// Format columns
-	nameText := padStr(name, effectiveNameW)
 	dateText := padStr(s.LastAccessedAt.Format("Jan 2 15:04"), dateW)
+	content := nameText + " │ " + dateText
 
-	row := rowPrefix + style.Render(nameText+" │ "+dateText)
-	return truncateRow(row, nameW+dateW+10) // truncate to safe width
+	// Get status style - preserve color even when selected by adding background
+	statusStyle := StatusStyle(s.Status.String())
+	if selected {
+		statusStyle = statusStyle.Background(surfaceColor)
+	}
+	statusSym := statusStyle.Render(s.Status.Symbol())
+
+	// Build styled prefix parts
+	var prefix string
+	if item.Indent > 0 {
+		if selected {
+			prefix = selectedItemStyle.Render(" "+treePrefix)
+		} else {
+			prefix = " " + treePrefix
+		}
+	}
+
+	// Pin symbol
+	if s.Pinned {
+		if selected {
+			prefix += selectedItemStyle.Render("✦")
+		} else {
+			prefix += selectedItemStyle.Render("✦")
+		}
+	} else {
+		if selected {
+			prefix += selectedItemStyle.Render(" ")
+		} else {
+			prefix += " "
+		}
+	}
+
+	// Status or X for delete
+	if showDeleteX {
+		if selected {
+			prefix += selectedItemStyle.Render("X ")
+		} else {
+			prefix += "X "
+		}
+	} else {
+		prefix += statusSym
+		if selected {
+			prefix += selectedItemStyle.Render(" ")
+		} else {
+			prefix += " "
+		}
+	}
+
+	// Apply style to content
+	if selected {
+		// Calculate remaining width for content
+		contentWidth := totalWidth - 4 - prefixExtra // rough prefix width
+		if contentWidth < len(content) {
+			contentWidth = len(content)
+		}
+		return prefix + selectedItemStyle.Width(contentWidth).Render(content)
+	} else if hovered {
+		return prefix + hoverItemStyle.Render(content)
+	}
+	return prefix + itemStyle.Render(content)
 }
 
 // truncateRow truncates a row to maxWidth, accounting for ANSI codes
@@ -982,7 +1014,6 @@ type ListKeyMap struct {
 	NewSession    key.Binding
 	Pin           key.Binding
 	Layout        key.Binding
-	Terminal      key.Binding
 	Theme         key.Binding
 	Resume        key.Binding
 }
@@ -1057,10 +1088,6 @@ func DefaultListKeyMap() ListKeyMap {
 		Layout: key.NewBinding(
 			key.WithKeys("L"),
 			key.WithHelp("L", "layout"),
-		),
-		Terminal: key.NewBinding(
-			key.WithKeys("T"),
-			key.WithHelp("T", "terminal"),
 		),
 		Theme: key.NewBinding(
 			key.WithKeys("C"),

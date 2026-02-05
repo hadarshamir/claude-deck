@@ -220,18 +220,18 @@ var (
 )
 
 // CurrentThemeName tracks the active theme
-var CurrentThemeName = "Catppuccin Mocha"
+var CurrentThemeName = "Dracula"
 
 func init() {
-	ApplyTheme("Catppuccin Mocha")
+	ApplyTheme("Dracula")
 }
 
 // ApplyTheme applies a theme by name
 func ApplyTheme(name string) {
 	theme, ok := Themes[name]
 	if !ok {
-		theme = Themes["Catppuccin Mocha"]
-		name = "Catppuccin Mocha"
+		theme = Themes["Dracula"]
+		name = "Dracula"
 	}
 	CurrentThemeName = name
 
@@ -273,6 +273,7 @@ func ApplyTheme(name string) {
 
 	selectedItemStyle = lipgloss.NewStyle().
 		Foreground(primaryColor).
+		Background(surfaceColor).
 		Bold(true)
 
 	hoverItemStyle = lipgloss.NewStyle().
@@ -284,6 +285,7 @@ func ApplyTheme(name string) {
 
 	selectedGroupStyle = lipgloss.NewStyle().
 		Foreground(primaryColor).
+		Background(surfaceColor).
 		Bold(true)
 
 	statusRunningStyle = lipgloss.NewStyle().
