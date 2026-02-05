@@ -10,10 +10,21 @@ A TUI session manager for Claude Code. Discover, organize, and quickly resume yo
 - **Live Status** - Shows running/waiting/idle status via Kitty window tracking
 - **Tab Name Sync** - Session names sync from Claude's tab titles automatically
 - **Organization** - Groups, pinning, renaming, and custom ordering
-- **Quick Resume** - Open sessions in new terminal tabs with `--resume`
+- **Quick Resume** - Open sessions in new Kitty tabs with `--resume`
 - **Live Preview** - See conversation messages with real-time updates
 - **Search** - Fuzzy search by name (`/`) or search within content (`?`)
-- **Multi-Terminal** - Supports Kitty, iTerm2, Ghostty, and Terminal.app
+- **Themes** - 8 color themes (Catppuccin, Dracula, Nord, Tokyo Night, etc.)
+
+## Requirements
+
+- [Kitty](https://sw.kovidgoyal.net/kitty/) terminal emulator with remote control enabled
+- Go 1.21+ (for building from source)
+
+Enable Kitty remote control in `~/.config/kitty/kitty.conf`:
+```
+allow_remote_control yes
+listen_on unix:/tmp/kitty
+```
 
 ## Installation
 
@@ -67,9 +78,8 @@ deck
 | Key | Action |
 |-----|--------|
 | `L` | Toggle layout (side-by-side / stacked) |
-| `T` | Select terminal emulator |
 | `C` | Select color theme |
-| `S` | Toggle resume on startup |
+| `S` | Toggle auto-resume on startup |
 
 **Other**
 | Key | Action |
