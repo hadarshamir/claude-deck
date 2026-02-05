@@ -984,6 +984,7 @@ type ListKeyMap struct {
 	Layout        key.Binding
 	Terminal      key.Binding
 	Theme         key.Binding
+	Resume        key.Binding
 }
 
 // DefaultListKeyMap returns the default key bindings
@@ -998,12 +999,12 @@ func DefaultListKeyMap() ListKeyMap {
 			key.WithHelp("↓", "down"),
 		),
 		ShiftUp: key.NewBinding(
-			key.WithKeys("shift+up", "K"),
-			key.WithHelp("⇧↑/K", "up fast"),
+			key.WithKeys("shift+up"),
+			key.WithHelp("⇧↑", "up fast"),
 		),
 		ShiftDown: key.NewBinding(
-			key.WithKeys("shift+down", "J"),
-			key.WithHelp("⇧↓/J", "down fast"),
+			key.WithKeys("shift+down"),
+			key.WithHelp("⇧↓", "down fast"),
 		),
 		Left: key.NewBinding(
 			key.WithKeys("left"),
@@ -1064,6 +1065,10 @@ func DefaultListKeyMap() ListKeyMap {
 		Theme: key.NewBinding(
 			key.WithKeys("C"),
 			key.WithHelp("C", "theme"),
+		),
+		Resume: key.NewBinding(
+			key.WithKeys("S"),
+			key.WithHelp("S", "resume"),
 		),
 	}
 }

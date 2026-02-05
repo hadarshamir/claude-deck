@@ -20,10 +20,13 @@ func StorageFile() string {
 
 // Settings represents user preferences
 type Settings struct {
-	PreferredTerminal  string `json:"preferred_terminal"`   // "Auto", "iTerm2", "Ghostty", "Kitty", "Terminal"
-	ActiveExpanded     *bool  `json:"active_expanded,omitempty"`   // Active group expanded state
-	InactiveExpanded   *bool  `json:"inactive_expanded,omitempty"` // Inactive group expanded state
-	Theme              string `json:"theme,omitempty"`             // Color theme name
+	PreferredTerminal    string   `json:"preferred_terminal"`             // "Auto", "iTerm2", "Ghostty", "Kitty", "Terminal"
+	ActiveExpanded       *bool    `json:"active_expanded,omitempty"`      // Active group expanded state
+	InactiveExpanded     *bool    `json:"inactive_expanded,omitempty"`    // Inactive group expanded state
+	Theme                string   `json:"theme,omitempty"`                // Color theme name
+	ResumeOnStartup      bool     `json:"resume_on_startup,omitempty"`    // Restore active sessions on startup
+	LastActiveSessionIDs []string `json:"last_active_sessions,omitempty"` // Session IDs that were active
+	FavoritePaths        []string `json:"favorite_paths,omitempty"`       // User's favorite project paths
 }
 
 // StorageData represents the persisted data structure
@@ -79,12 +82,14 @@ func SaveStorage(data *StorageData) error {
 
 // MergeSessions combines discovered sessions with stored metadata
 func MergeSessions(discovered []*Session, stored *StorageData) []*Session {
-	// Build a map of stored sessions by Claude session ID + project path
+	// Build a map of stored sessions by ClaudeSessionID (UUID is globally unique)
 	storedMap := make(map[string]*Session)
 	for _, s := range stored.Sessions {
-		key := s.ClaudeSessionID + ":" + s.ProjectPath
-		storedMap[key] = s
+		storedMap[s.ClaudeSessionID] = s
 	}
+
+	// Track which stored sessions were matched
+	matchedStored := make(map[string]bool)
 
 	// Find min order so new sessions appear at top
 	minOrder := 1
@@ -98,16 +103,26 @@ func MergeSessions(discovered []*Session, stored *StorageData) []*Session {
 	var result []*Session
 	var newSessions []*Session
 	for _, d := range discovered {
-		key := d.ClaudeSessionID + ":" + d.ProjectPath
-		if s, ok := storedMap[key]; ok {
+		if s, ok := storedMap[d.ClaudeSessionID]; ok {
 			// Use stored metadata but update runtime fields
+			s.ID = d.ID // Normalize ID to ClaudeSessionID format
 			s.JSONLPath = d.JSONLPath
 			s.LastAccessedAt = d.LastAccessedAt
 			s.GitBranch = d.GitBranch
 			result = append(result, s)
+			matchedStored[s.ClaudeSessionID] = true
 		} else {
 			// New session discovered - collect for ordering
 			newSessions = append(newSessions, d)
+		}
+	}
+
+	// Preserve pending sessions (have KittyWindowID but no JSONL yet)
+	for _, s := range stored.Sessions {
+		if !matchedStored[s.ClaudeSessionID] && s.KittyWindowID > 0 {
+			// This is a pending session waiting for JSONL to be created
+			s.Status = StatusWaiting
+			result = append(result, s)
 		}
 	}
 
@@ -177,8 +192,7 @@ func (m *Manager) Load() error {
 	// Capture original Order values BEFORE merge (since merge modifies in place)
 	originalOrders := make(map[string]int)
 	for _, s := range stored.Sessions {
-		key := s.ClaudeSessionID + ":" + s.ProjectPath
-		originalOrders[key] = s.Order
+		originalOrders[s.ClaudeSessionID] = s.Order
 	}
 
 	// Check if we had sessions before (to detect new ones)
@@ -197,8 +211,7 @@ func (m *Manager) Load() error {
 	needsSave := len(m.Sessions) != hadSessions
 	if !needsSave {
 		for _, s := range m.Sessions {
-			key := s.ClaudeSessionID + ":" + s.ProjectPath
-			if orig, ok := originalOrders[key]; !ok || orig != s.Order {
+			if orig, ok := originalOrders[s.ClaudeSessionID]; !ok || orig != s.Order {
 				needsSave = true
 				break
 			}
@@ -288,6 +301,105 @@ func (m *Manager) SetInactiveExpanded(expanded bool) {
 	m.Settings.InactiveExpanded = &expanded
 }
 
+// GetResumeOnStartup returns whether to restore sessions on startup
+func (m *Manager) GetResumeOnStartup() bool {
+	if m.Settings == nil {
+		return false
+	}
+	return m.Settings.ResumeOnStartup
+}
+
+// SetResumeOnStartup updates the resume on startup setting
+func (m *Manager) SetResumeOnStartup(resume bool) error {
+	if m.Settings == nil {
+		m.Settings = &Settings{}
+	}
+	m.Settings.ResumeOnStartup = resume
+	return m.Save()
+}
+
+// GetLastActiveSessionIDs returns the list of previously active session IDs
+func (m *Manager) GetLastActiveSessionIDs() []string {
+	if m.Settings == nil {
+		return nil
+	}
+	return m.Settings.LastActiveSessionIDs
+}
+
+// SetLastActiveSessionIDs updates the list of active session IDs
+func (m *Manager) SetLastActiveSessionIDs(ids []string) {
+	if m.Settings == nil {
+		m.Settings = &Settings{}
+	}
+	m.Settings.LastActiveSessionIDs = ids
+}
+
+// GetFavoritePaths returns the user's favorite paths
+func (m *Manager) GetFavoritePaths() []string {
+	if m.Settings == nil {
+		return nil
+	}
+	return m.Settings.FavoritePaths
+}
+
+// IsFavoritePath checks if a path is in favorites
+func (m *Manager) IsFavoritePath(path string) bool {
+	for _, p := range m.GetFavoritePaths() {
+		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+// ToggleFavoritePath adds or removes a path from favorites
+func (m *Manager) ToggleFavoritePath(path string) error {
+	if m.Settings == nil {
+		m.Settings = &Settings{}
+	}
+
+	// Check if already favorite
+	for i, p := range m.Settings.FavoritePaths {
+		if p == path {
+			// Remove it
+			m.Settings.FavoritePaths = append(m.Settings.FavoritePaths[:i], m.Settings.FavoritePaths[i+1:]...)
+			return m.Save()
+		}
+	}
+
+	// Add it
+	m.Settings.FavoritePaths = append(m.Settings.FavoritePaths, path)
+	return m.Save()
+}
+
+// GetUniqueProjectPaths returns unique project paths from all sessions, sorted by most recent
+func (m *Manager) GetUniqueProjectPaths() []string {
+	// Track paths with their most recent access time
+	pathTimes := make(map[string]int64)
+	for _, s := range m.Sessions {
+		if s.ProjectPath == "" {
+			continue
+		}
+		t := s.LastAccessedAt.Unix()
+		if existing, ok := pathTimes[s.ProjectPath]; !ok || t > existing {
+			pathTimes[s.ProjectPath] = t
+		}
+	}
+
+	// Convert to slice
+	paths := make([]string, 0, len(pathTimes))
+	for p := range pathTimes {
+		paths = append(paths, p)
+	}
+
+	// Sort by most recent first
+	sort.Slice(paths, func(i, j int) bool {
+		return pathTimes[paths[i]] > pathTimes[paths[j]]
+	})
+
+	return paths
+}
+
 // FindSession finds a session by ID
 func (m *Manager) FindSession(id string) *Session {
 	for _, s := range m.Sessions {
@@ -338,6 +450,16 @@ func (m *Manager) DeleteSession(id string) error {
 		}
 	}
 	return nil
+}
+
+// RemovePendingSession removes a pending session by ID (in-memory only, no save)
+func (m *Manager) RemovePendingSession(id string) {
+	for i, s := range m.Sessions {
+		if s.ID == id || s.ClaudeSessionID == id {
+			m.Sessions = append(m.Sessions[:i], m.Sessions[i+1:]...)
+			return
+		}
+	}
 }
 
 // MoveSession moves a session to a group

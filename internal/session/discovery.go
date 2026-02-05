@@ -86,10 +86,80 @@ func GetProjectPathFromJSONL(jsonlPath string) string {
 	return GetSessionFileInfo(jsonlPath).cwd
 }
 
+// ProjectPathFromJSONL extracts the project path from a JSONL file path
+// First tries to read the cwd from the JSONL file, falls back to decoding directory name
+func ProjectPathFromJSONL(jsonlPath string) string {
+	// Try reading the actual cwd from the JSONL file first (most accurate)
+	if cwd := GetProjectPathFromJSONL(jsonlPath); cwd != "" {
+		return cwd
+	}
+	// Fall back to decoding directory name (lossy - hyphens in names get confused)
+	dir := filepath.Dir(jsonlPath)
+	encoded := filepath.Base(dir)
+	return DecodeProjectPath(encoded)
+}
+
 // EncodeProjectPath converts a path to the encoded directory name format
 func EncodeProjectPath(path string) string {
-	// Remove leading slash and replace all slashes with dashes
-	return strings.ReplaceAll(path, "/", "-")
+	// Claude replaces both / and _ with -
+	encoded := strings.ReplaceAll(path, "/", "-")
+	encoded = strings.ReplaceAll(encoded, "_", "-")
+	return encoded
+}
+
+// GetSessionUUIDsAtPath returns all session UUIDs (from JSONL filenames) for a project path
+func GetSessionUUIDsAtPath(projectPath string) []string {
+	projectsDir := ClaudeProjectsDir()
+	encodedPath := EncodeProjectPath(projectPath)
+	projectDir := filepath.Join(projectsDir, encodedPath)
+
+	jsonlFiles, err := filepath.Glob(filepath.Join(projectDir, "*.jsonl"))
+	if err != nil {
+		return nil
+	}
+
+	var uuids []string
+	for _, jsonlPath := range jsonlFiles {
+		sessionID := strings.TrimSuffix(filepath.Base(jsonlPath), ".jsonl")
+		if isValidUUID(sessionID) {
+			uuids = append(uuids, sessionID)
+		}
+	}
+	return uuids
+}
+
+// FindNewestSessionAtPath returns the UUID of the most recently modified JSONL at a path
+func FindNewestSessionAtPath(projectPath string) string {
+	projectsDir := ClaudeProjectsDir()
+	encodedPath := EncodeProjectPath(projectPath)
+	projectDir := filepath.Join(projectsDir, encodedPath)
+
+	jsonlFiles, err := filepath.Glob(filepath.Join(projectDir, "*.jsonl"))
+	if err != nil {
+		return ""
+	}
+
+	var newestUUID string
+	var newestTime time.Time
+
+	for _, jsonlPath := range jsonlFiles {
+		sessionID := strings.TrimSuffix(filepath.Base(jsonlPath), ".jsonl")
+		if !isValidUUID(sessionID) {
+			continue
+		}
+
+		info, err := os.Stat(jsonlPath)
+		if err != nil {
+			continue
+		}
+
+		if info.ModTime().After(newestTime) {
+			newestTime = info.ModTime()
+			newestUUID = sessionID
+		}
+	}
+
+	return newestUUID
 }
 
 // DiscoverSessions scans ~/.claude/projects for Claude Code sessions
@@ -139,18 +209,13 @@ func DiscoverSessions() ([]*Session, error) {
 			// Get session info from JSONL (cwd and content check)
 			fileInfo := GetSessionFileInfo(jsonlPath)
 
-			// Skip sessions with no actual conversation content
-			if !fileInfo.hasContent {
-				continue
-			}
-
 			actualPath := fileInfo.cwd
 			if actualPath == "" {
 				actualPath = projectPath // Fallback to decoded path
 			}
 
 			session := &Session{
-				ID:              generateSessionID(actualPath, sessionID),
+				ID:              sessionID, // Use ClaudeSessionID directly as the unique ID
 				Name:            formatSessionName(actualPath, info.ModTime()),
 				ProjectPath:     actualPath,
 				ClaudeSessionID: sessionID,
@@ -171,16 +236,6 @@ func DiscoverSessions() ([]*Session, error) {
 func isValidUUID(s string) bool {
 	_, err := uuid.Parse(s)
 	return err == nil
-}
-
-// generateSessionID creates a unique ID for our session tracking
-func generateSessionID(projectPath, claudeSessionID string) string {
-	// Use first 8 chars of Claude session ID + encoded project path
-	shortID := claudeSessionID
-	if len(shortID) > 8 {
-		shortID = shortID[:8]
-	}
-	return shortID + "-" + EncodeProjectPath(projectPath)
 }
 
 // formatSessionName creates a default name for a session

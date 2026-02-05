@@ -2,7 +2,6 @@ package session
 
 import (
 	"encoding/json"
-	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -49,14 +48,30 @@ type StatusUpdate struct {
 }
 
 // ComputeStatuses computes status updates without modifying sessions (thread-safe)
-// Returns (updates, namesChanged, anyChanged)
-func ComputeStatuses(sessions []*Session) ([]StatusUpdate, bool, bool) {
+// Returns (updates, activeWindowIDs, namesChanged, anyChanged)
+func ComputeStatuses(sessions []*Session) ([]StatusUpdate, map[int]bool, bool, bool) {
+	return computeStatusesInternal(sessions, false)
+}
+
+// ComputeStatusesAggressive is like ComputeStatuses but also syncs names and claims
+// window IDs for path-only matches. Use on startup when we can trust path matches.
+func ComputeStatusesAggressive(sessions []*Session) ([]StatusUpdate, map[int]bool, bool, bool) {
+	return computeStatusesInternal(sessions, true)
+}
+
+func computeStatusesInternal(sessions []*Session, aggressive bool) ([]StatusUpdate, map[int]bool, bool, bool) {
 	var updates []StatusUpdate
 	namesChanged := false
 	anyChanged := false
 
 	// Get active kitty sessions
 	activeSessions := getKittyActiveSessions()
+
+	// Build map of all active window IDs
+	activeWindowIDs := make(map[int]bool)
+	for _, as := range activeSessions {
+		activeWindowIDs[as.windowID] = true
+	}
 
 	// Sort sessions by JSONL modification time (most recent first)
 	type sessionWithMtime struct {
@@ -104,17 +119,19 @@ func ComputeStatuses(sessions []*Session) ([]StatusUpdate, bool, bool) {
 		}
 
 		// Track if window ID changed (for reliable future matching)
-		// Only store window ID for strong matches to avoid polluting data
-		if strongMatch && windowID != sw.session.KittyWindowID {
+		// In aggressive mode (startup), claim window IDs even for path matches
+		// Otherwise, only store window ID for strong matches to avoid polluting data
+		if (strongMatch || aggressive) && windowID != sw.session.KittyWindowID {
 			anyChanged = true
-		} else if !strongMatch {
+		} else if !strongMatch && !aggressive {
 			// Don't store window ID for weak (path-only) matches
 			update.KittyWindowID = sw.session.KittyWindowID // Keep existing
 		}
 
-		// Compute name update from tab title ONLY for strong matches
-		// Path-only matches are unreliable - could be wrong session
-		if strongMatch && tabTitle != "" && !sw.session.Renamed {
+		// Compute name update from tab title
+		// In aggressive mode (startup), sync names even for path matches
+		// Otherwise, only sync for strong matches (path-only matches are unreliable)
+		if (strongMatch || aggressive) && tabTitle != "" && !sw.session.Renamed {
 			cleanTitle := cleanClaudeTitle(tabTitle)
 			if cleanTitle != "" && cleanTitle != sw.session.Name {
 				update.Name = cleanTitle
@@ -126,7 +143,7 @@ func ComputeStatuses(sessions []*Session) ([]StatusUpdate, bool, bool) {
 		updates = append(updates, update)
 	}
 
-	return updates, namesChanged, anyChanged
+	return updates, activeWindowIDs, namesChanged, anyChanged
 }
 
 // ApplyStatusUpdates applies computed updates to sessions (must be called from main thread)
@@ -185,7 +202,15 @@ func ApplyStatusUpdates(sessions []*Session, updates []StatusUpdate) (bool, bool
 // RefreshStatuses updates status for all sessions (convenience wrapper)
 // Returns true if any persisted fields were updated (caller should save)
 func RefreshStatuses(sessions []*Session) bool {
-	updates, _, _ := ComputeStatuses(sessions)
+	updates, _, _, _ := ComputeStatuses(sessions)
+	_, needsSave := ApplyStatusUpdates(sessions, updates)
+	return needsSave
+}
+
+// RefreshStatusesAggressive is like RefreshStatuses but also syncs names and claims
+// window IDs for path-only matches. Use on startup when we can trust path matches.
+func RefreshStatusesAggressive(sessions []*Session) bool {
+	updates, _, _, _ := ComputeStatusesAggressive(sessions)
 	_, needsSave := ApplyStatusUpdates(sessions, updates)
 	return needsSave
 }
@@ -377,6 +402,7 @@ func detectSessionStatus(s *Session, activeSessions []activeSession, matchedWind
 	tabTitle := ""
 	matchedWindowID := 0
 	strongMatch := false // true if we're confident about the match (--resume or stored window ID)
+	hasSpinner := false  // true if matched tab has spinner (Claude actively working)
 
 	// 1. First, try to match by stored KittyWindowID (for sessions opened via claude-deck)
 	// BUT only if the tab doesn't have a --resume flag pointing to a different session
@@ -397,6 +423,7 @@ func detectSessionStatus(s *Session, activeSessions []activeSession, matchedWind
 				tabTitle = active.tabTitle
 				matchedWindowID = active.windowID
 				strongMatch = true // We trust stored window IDs
+				hasSpinner = active.hasSpinner
 				matchedWindows[active.windowID] = true
 				break
 			}
@@ -415,6 +442,7 @@ func detectSessionStatus(s *Session, activeSessions []activeSession, matchedWind
 				tabTitle = active.tabTitle
 				matchedWindowID = active.windowID
 				strongMatch = true // --resume is ground truth
+				hasSpinner = active.hasSpinner
 				matchedWindows[active.windowID] = true
 				break
 			}
@@ -445,6 +473,7 @@ func detectSessionStatus(s *Session, activeSessions []activeSession, matchedWind
 			matchedWindowID = active.windowID
 			hasKittyTab = true
 			tabTitle = active.tabTitle
+			hasSpinner = active.hasSpinner
 			break
 		}
 	}
@@ -453,88 +482,49 @@ func detectSessionStatus(s *Session, activeSessions []activeSession, matchedWind
 		return StatusIdle, "", 0, false
 	}
 
-	// Session has active tab - check JSONL for activity
-	if s.JSONLPath == "" {
-		return StatusWaiting, tabTitle, matchedWindowID, strongMatch
-	}
-
-	info, err := os.Stat(s.JSONLPath)
-	if err != nil {
-		return StatusWaiting, tabTitle, matchedWindowID, strongMatch
-	}
-
-	age := time.Since(info.ModTime())
-
-	// Recent file activity = running (Claude is actively working)
-	if age < 10*time.Second {
+	// Spinner is the only reliable signal for active work
+	// (JSONL mtime is not reliable without polling)
+	if hasSpinner {
 		return StatusRunning, tabTitle, matchedWindowID, strongMatch
 	}
 
-	// No recent activity - check if waiting for user input
-	// (tool approval, question, etc.)
 	return StatusWaiting, tabTitle, matchedWindowID, strongMatch
 }
 
-// needsUserInput checks if the session is waiting for user input
-// by examining the last few entries in the JSONL file
-func needsUserInput(jsonlPath string) bool {
-	file, err := os.Open(jsonlPath)
-	if err != nil {
-		return false
-	}
-	defer file.Close()
-
-	// Read last 50KB of file to find recent messages
-	const tailSize = 50 * 1024
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
-
-	start := info.Size() - tailSize
-	if start < 0 {
-		start = 0
-	}
-
-	file.Seek(start, 0)
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return false
-	}
-
-	content := string(data)
-
-	// Find the last complete JSON line
-	lines := strings.Split(content, "\n")
-
-	// Look at the last few lines for indicators
-	for i := len(lines) - 1; i >= 0 && i >= len(lines)-10; i-- {
-		line := lines[i]
-		if line == "" {
-			continue
-		}
-
-		// Check for tool use requiring approval
-		if strings.Contains(line, `"type":"tool_use"`) &&
-		   !strings.Contains(line, `"tool_result"`) {
-			// Has tool_use but no result yet - might be waiting for approval
-			return true
-		}
-
-		// Check for assistant asking a question (ends with ?)
-		if strings.Contains(line, `"role":"assistant"`) &&
-		   strings.Contains(line, `"type":"text"`) {
-			// This is an assistant text message - check if it's asking something
-			if strings.Contains(line, "?\"") || strings.Contains(line, "?\n") {
-				return true
+// FindWindowIDForSession finds the Kitty window ID for a session
+// Uses same matching logic as detectSessionStatus: stored ID → --resume flag → project path
+func FindWindowIDForSession(s *Session) int {
+	// 1. Use stored KittyWindowID if available and still exists
+	if s.KittyWindowID > 0 {
+		activeSessions := getKittyActiveSessions()
+		for _, active := range activeSessions {
+			if active.windowID == s.KittyWindowID {
+				return s.KittyWindowID
 			}
 		}
+	}
 
-		// Found a user message - not waiting for input
-		if strings.Contains(line, `"role":"user"`) {
-			return false
+	// 2. Search active sessions for matching --resume flag or project path
+	activeSessions := getKittyActiveSessions()
+
+	// Try session ID match first (strongest)
+	for _, active := range activeSessions {
+		if active.sessionID != "" && active.sessionID == s.ClaudeSessionID {
+			return active.windowID
 		}
 	}
 
-	return false
+	// Fall back to project path match
+	for _, active := range activeSessions {
+		if active.sessionID != "" {
+			continue // Skip tabs that have explicit session IDs
+		}
+		if active.projectPath == s.ProjectPath ||
+			strings.HasPrefix(active.projectPath, s.ProjectPath+"/") {
+			return active.windowID
+		}
+	}
+
+	return 0
 }
+

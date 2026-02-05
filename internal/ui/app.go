@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -58,6 +60,24 @@ type App struct {
 	terminalCursor int // cursor position in terminal selection
 	showTheme    bool // true when theme selection overlay is visible
 	themeCursor  int  // cursor position in theme selection
+
+	// New session dialog
+	showNewSession        bool     // true when new session dialog is visible
+	newSessionPaths       []string // list of paths to show (favorites + recent)
+	newSessionCursor      int      // cursor position in paths list
+	newSessionFocus       int      // 0=name, 1=path, 2=list
+	newSessionName        string   // session name input
+	newSessionNameCursor int    // cursor in name field
+	newSessionPath       string // path input
+	newSessionPathCursor int    // cursor in path field
+
+	// Pending new session - waiting to be matched by window ID or file watcher
+	pendingRenamePath    string
+	pendingRenameName    string
+	pendingRenameWindowID int // kitty window ID for matching
+
+	// Skip next status save to avoid race condition with rename
+	skipNextStatusSave bool
 }
 
 // NewApp creates a new application instance
@@ -100,8 +120,9 @@ func (a *App) loadSessions() tea.Cmd {
 	return func() tea.Msg {
 		err := a.manager.Load()
 		if err == nil {
-			if session.RefreshStatuses(a.manager.Sessions) {
-				a.manager.Save() // Persist tab title names
+			// Use aggressive mode on startup to sync names even for path-only matches
+			if session.RefreshStatusesAggressive(a.manager.Sessions) {
+				a.manager.Save() // Persist tab title names and window IDs
 			}
 			// Refresh git branches (one git call per unique path)
 			session.RefreshGitBranches(a.manager.Sessions)
@@ -110,30 +131,15 @@ func (a *App) loadSessions() tea.Cmd {
 	}
 }
 
-// tickStatus periodically updates session statuses
-func (a *App) tickStatus() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
-		return statusTickMsg{}
-	})
-}
-
-// tickDiscovery periodically refreshes git info (every 30s to save battery)
-func (a *App) tickDiscovery() tea.Cmd {
-	return tea.Tick(30*time.Second, func(t time.Time) tea.Msg {
-		return sessionDiscoveryTickMsg{}
-	})
-}
-
-type statusTickMsg struct{}
 type statusRefreshedMsg struct {
-	updates   []session.StatusUpdate
-	noChanges bool // true if nothing changed - skip re-render
+	updates         []session.StatusUpdate
+	activeWindowIDs map[int]bool // all active kitty window IDs
+	noChanges       bool         // true if nothing changed - skip re-render
 }
 type clearStatusMsg struct{}
 type sessionsLoadedMsg struct {
 	err error
 }
-type sessionDiscoveryTickMsg struct{}
 
 // setStatus sets a status message and returns a command to clear it after 2 seconds
 func (a *App) setStatus(msg string) tea.Cmd {
@@ -143,12 +149,34 @@ func (a *App) setStatus(msg string) tea.Cmd {
 	})
 }
 
-// watchFiles sets up file watching
+// refreshStatusesAsync computes status updates asynchronously
+func (a *App) refreshStatusesAsync() tea.Cmd {
+	sessions := a.manager.Sessions
+	return func() tea.Msg {
+		updates, activeWindowIDs, _, anyChanged := session.ComputeStatuses(sessions)
+		return statusRefreshedMsg{updates: updates, activeWindowIDs: activeWindowIDs, noChanges: !anyChanged}
+	}
+}
+
+// watchFiles sets up file watching for session changes
 func (a *App) watchFiles() tea.Cmd {
 	return func() tea.Msg {
-		// Watch the Claude projects directory
-		if err := a.watcher.Add(session.ClaudeProjectsDir()); err != nil {
+		projectsDir := session.ClaudeProjectsDir()
+
+		// Watch the top-level projects directory for new project dirs
+		if err := a.watcher.Add(projectsDir); err != nil {
 			return nil
+		}
+
+		// Watch all existing project subdirectories for new/changed JSONL files
+		entries, err := os.ReadDir(projectsDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					subdir := filepath.Join(projectsDir, entry.Name())
+					a.watcher.Add(subdir)
+				}
+			}
 		}
 
 		for {
@@ -157,8 +185,20 @@ func (a *App) watchFiles() tea.Cmd {
 				if !ok {
 					return nil
 				}
-				if event.Op&fsnotify.Write == fsnotify.Write {
+				// New JSONL file created = new session
+				if event.Op&fsnotify.Create == fsnotify.Create && strings.HasSuffix(event.Name, ".jsonl") {
+					return newSessionFileMsg{path: event.Name}
+				}
+				// Existing JSONL modified = refresh preview
+				if event.Op&fsnotify.Write == fsnotify.Write && strings.HasSuffix(event.Name, ".jsonl") {
 					return fileChangedMsg{path: event.Name}
+				}
+				// New project directory created = watch it
+				if event.Op&fsnotify.Create == fsnotify.Create {
+					info, err := os.Stat(event.Name)
+					if err == nil && info.IsDir() {
+						a.watcher.Add(event.Name)
+					}
 				}
 			case _, ok := <-a.watcher.Errors:
 				if !ok {
@@ -170,6 +210,10 @@ func (a *App) watchFiles() tea.Cmd {
 }
 
 type fileChangedMsg struct {
+	path string
+}
+
+type newSessionFileMsg struct {
 	path string
 }
 
@@ -187,7 +231,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, tea.Quit
 		}
 
-		if msg.String() == "q" && !a.dialog.IsOpen() && !a.search.IsActive() {
+		if msg.String() == "Q" && !a.dialog.IsOpen() && !a.search.IsActive() {
 			a.quitting = true
 			if a.watcher != nil {
 				a.watcher.Close()
@@ -201,33 +245,94 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.updateLayout()
 		return a, nil
 
+	case tea.FocusMsg:
+		// Window gained focus - refresh status and sync tab names
+		return a, a.refreshStatusesAsync()
+
 	case tea.MouseMsg:
 		return a.handleMouse(msg)
 
-	case statusTickMsg:
-		// Compute status updates async
-		sessions := a.manager.Sessions
-		return a, func() tea.Msg {
-			updates, _, anyChanged := session.ComputeStatuses(sessions)
-			return statusRefreshedMsg{updates: updates, noChanges: !anyChanged}
-		}
-
 	case statusRefreshedMsg:
-		// Skip if nothing changed
-		if msg.noChanges {
-			return a, a.tickStatus()
+		// Skip if nothing changed and no pending session
+		if msg.noChanges && a.pendingRenameWindowID == 0 {
+			return a, nil
 		}
 
 		// Apply updates to session objects (modifies Status field in place)
 		// No need to update pointers - sessions haven't been reloaded
-		_, needsSave := session.ApplyStatusUpdates(a.manager.Sessions, msg.updates)
+		changed, needsSave := session.ApplyStatusUpdates(a.manager.Sessions, msg.updates)
 
-		// Save if persisted fields changed (names, window IDs)
-		if needsSave {
-			a.manager.Save()
+		// Remove pending sessions whose windows no longer exist
+		if msg.activeWindowIDs != nil {
+			var remainingSessions []*session.Session
+			for _, s := range a.manager.Sessions {
+				isPending := strings.HasPrefix(s.ClaudeSessionID, "pending-")
+				windowGone := s.KittyWindowID > 0 && !msg.activeWindowIDs[s.KittyWindowID]
+				if isPending && windowGone {
+					// Pending session's window was closed - remove it
+					changed = true
+					needsSave = true
+					continue
+				}
+				remainingSessions = append(remainingSessions, s)
+			}
+			a.manager.Sessions = remainingSessions
 		}
 
-		return a, a.tickStatus()
+		// Check for pending new session matched by window ID
+		var statusCmd tea.Cmd
+		if a.pendingRenameWindowID > 0 {
+			// Check if the pending window was closed
+			windowStillExists := msg.activeWindowIDs != nil && msg.activeWindowIDs[a.pendingRenameWindowID]
+			if !windowStillExists {
+				// Window was closed before JSONL was created - clear pending state
+				a.pendingRenamePath = ""
+				a.pendingRenameName = ""
+				a.pendingRenameWindowID = 0
+			} else {
+				// Try to match to a session
+				matched := false
+				for _, s := range a.manager.Sessions {
+					if s.KittyWindowID == a.pendingRenameWindowID {
+						// Found the session - apply pending name
+						if a.pendingRenameName != "" && !s.Renamed {
+							a.manager.RenameSession(s.ID, a.pendingRenameName)
+							statusCmd = a.setStatus("Created: " + a.pendingRenameName)
+						}
+						changed = true
+						needsSave = true
+						matched = true
+						break
+					}
+				}
+				// Clear pending state if matched (otherwise keep waiting for JSONL)
+				if matched {
+					a.pendingRenamePath = ""
+					a.pendingRenameName = ""
+					a.pendingRenameWindowID = 0
+				}
+			}
+		}
+
+		// Track active sessions for resume on startup
+		a.trackActiveSessions()
+
+		// Save if persisted fields changed (names, window IDs)
+		// But skip if we just did a rename to avoid race condition
+		if needsSave && !a.skipNextStatusSave {
+			a.manager.Save()
+		}
+		a.skipNextStatusSave = false
+
+		// Refresh list if any status changed (moves sessions between Active/Inactive)
+		if changed {
+			a.list.Refresh()
+		}
+
+		if statusCmd != nil {
+			return a, statusCmd
+		}
+		return a, nil
 
 	case clearStatusMsg:
 		a.statusMsg = ""
@@ -259,22 +364,89 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.watcher != nil {
 			cmds = append(cmds, a.watchFiles())
 		}
-		cmds = append(cmds, a.tickStatus())
-		cmds = append(cmds, a.tickDiscovery())
+		// Restore previously active sessions if enabled
+		if cmd := a.restoreSessions(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		return a, tea.Batch(cmds...)
 
-	case sessionDiscoveryTickMsg:
-		// Git branch comes from JSONL - no polling needed
-		return a, a.tickDiscovery()
 
 	case fileChangedMsg:
+		// JSONL file was modified - trigger status refresh for all sessions
+		// This captures activity from any Claude tab
+		var cmds []tea.Cmd
+
+		// Restart file watcher (it returns after each event)
+		if a.watcher != nil {
+			cmds = append(cmds, a.watchFiles())
+		}
+
 		// Refresh preview if the changed file is the current session
 		if item := a.list.SelectedItem(); item != nil && !item.IsGroup() {
 			if item.Session.JSONLPath == msg.path {
-				return a, a.preview.Refresh()
+				cmds = append(cmds, a.preview.Refresh())
 			}
 		}
-		return a, nil
+
+		// Trigger async status refresh
+		cmds = append(cmds, a.refreshStatusesAsync())
+		return a, tea.Batch(cmds...)
+
+	case newSessionFileMsg:
+		// Build commands - always restart watcher
+		var cmds []tea.Cmd
+		if a.watcher != nil {
+			cmds = append(cmds, a.watchFiles())
+		}
+
+		statusMsg := "New session discovered"
+
+		// Check if we have a pending new session waiting for this file
+		if a.pendingRenameWindowID > 0 {
+			// Remove the pending session before reloading
+			pendingID := fmt.Sprintf("pending-%d", a.pendingRenameWindowID)
+			a.manager.RemovePendingSession(pendingID)
+		}
+
+		// Reload sessions to discover new JSONL
+		a.manager.Load()
+
+		// Match pending session to discovered one
+		if a.pendingRenamePath != "" {
+			newProjectPath := session.ProjectPathFromJSONL(msg.path)
+
+			if newProjectPath == a.pendingRenamePath {
+				newest := session.FindNewestSessionAtPath(a.pendingRenamePath)
+				if newest != "" {
+					a.skipNextStatusSave = true
+
+					s := a.manager.FindSession(newest)
+					if s != nil {
+						// Apply the pending name
+						if a.pendingRenameName != "" {
+							a.manager.RenameSession(s.ID, a.pendingRenameName)
+							statusMsg = "Created: " + a.pendingRenameName
+						}
+						// Claim the window ID
+						s.Status = session.StatusWaiting
+						if a.pendingRenameWindowID > 0 {
+							session.ClaimWindowID(a.manager.Sessions, s, a.pendingRenameWindowID)
+							s.KittyWindowID = a.pendingRenameWindowID
+						}
+						a.manager.Save()
+					}
+				}
+			}
+		}
+
+		// Clear pending state
+		a.pendingRenamePath = ""
+		a.pendingRenameName = ""
+		a.pendingRenameWindowID = 0
+
+		a.list.Refresh()
+		cmds = append(cmds, a.setStatus(statusMsg))
+		return a, tea.Batch(cmds...)
 
 	case PreviewLoadedMsg:
 		a.preview.HandleLoaded(msg)
@@ -289,7 +461,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if a.showHelp {
 		if msg, ok := msg.(tea.KeyMsg); ok {
 			// Any key closes help
-			if msg.String() == "esc" || msg.String() == "h" || msg.String() == "enter" || msg.String() == "q" {
+			if msg.String() == "esc" || msg.String() == "h" || msg.String() == "enter" || msg.String() == "Q" {
 				a.showHelp = false
 			}
 		}
@@ -301,7 +473,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg, ok := msg.(tea.KeyMsg); ok {
 			allTerminals := terminal.AllTerminals()
 			switch msg.String() {
-			case "esc", "q":
+			case "esc", "Q":
 				a.showTerminal = false
 			case "enter":
 				// Apply selection
@@ -310,11 +482,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				terminal.SetPreferredTerminal(selected)
 				a.showTerminal = false
 				return a, a.setStatus("Terminal set to " + selected.String())
-			case "up", "k":
+			case "up":
 				if a.terminalCursor > 0 {
 					a.terminalCursor--
 				}
-			case "down", "j":
+			case "down":
 				if a.terminalCursor < len(allTerminals)-1 {
 					a.terminalCursor++
 				}
@@ -327,7 +499,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if a.showTheme {
 		if msg, ok := msg.(tea.KeyMsg); ok {
 			switch msg.String() {
-			case "esc", "q":
+			case "esc", "Q":
 				a.showTheme = false
 			case "enter":
 				// Apply selection
@@ -336,12 +508,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ApplyTheme(selected)
 				a.showTheme = false
 				return a, a.setStatus("Theme set to " + selected)
-			case "up", "k":
+			case "up":
 				if a.themeCursor > 0 {
 					a.themeCursor--
 					ApplyTheme(ThemeNames[a.themeCursor]) // Live preview
 				}
-			case "down", "j":
+			case "down":
 				if a.themeCursor < len(ThemeNames)-1 {
 					a.themeCursor++
 					ApplyTheme(ThemeNames[a.themeCursor]) // Live preview
@@ -349,6 +521,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return a, nil
+	}
+
+	// Handle new session dialog
+	if a.showNewSession {
+		return a.updateNewSessionDialog(msg)
 	}
 
 	// Handle dialog if open
@@ -552,7 +729,7 @@ func (a *App) updateContentSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.list.ConfirmContentSearch()
 			// Open the captured item
 			if item != nil && !item.IsGroup() {
-				windowID, err := terminal.OpenSession(item.Session.ProjectPath, item.Session.ClaudeSessionID, session.GetActiveWindowID(item.Session))
+				windowID, err := terminal.OpenSession(item.Session.ProjectPath, item.Session.ClaudeSessionID, session.GetActiveWindowID(item.Session), item.Session.Name)
 				if err != nil {
 					return a, a.setStatus("Error: " + err.Error())
 				}
@@ -758,11 +935,15 @@ func (a *App) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, a.keys.Kill):
 			// Kill closes the tab and moves session to inactive
 			if item := a.list.SelectedItem(); item != nil && !item.IsGroup() {
-				if item.Session.KittyWindowID > 0 {
-					terminal.CloseKittyWindow(item.Session.KittyWindowID)
-					item.Session.KittyWindowID = 0
+				// Find window ID using all matching strategies (stored ID, --resume flag, project path)
+				windowID := session.FindWindowIDForSession(item.Session)
+				if windowID > 0 {
+					terminal.CloseKittyWindow(windowID)
 				}
+				item.Session.KittyWindowID = 0
 				item.Session.Status = session.StatusIdle
+				// Update last_active_sessions so killed session won't be resumed
+				a.trackActiveSessions()
 				a.manager.Save()
 				a.list.Refresh()
 				return a, a.setStatus("Session killed")
@@ -819,22 +1000,38 @@ func (a *App) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return a, nil
 
-		case key.Matches(msg, a.keys.NewSession):
-			// New session - use selected session's project or prompt
-			if item := a.list.SelectedItem(); item != nil && !item.IsGroup() {
-				terminal.NewSession(item.Session.ProjectPath)
-				return a, a.setStatus("Opening new session in " + item.Session.FolderName() + "...")
-			} else {
-				return a, a.setStatus("Select a session first")
+		case key.Matches(msg, a.keys.Resume):
+			// Toggle resume on startup setting
+			current := a.manager.GetResumeOnStartup()
+			a.manager.SetResumeOnStartup(!current)
+			if !current {
+				return a, a.setStatus("Resume on startup: enabled")
 			}
+			return a, a.setStatus("Resume on startup: disabled")
 
-		case msg.String() == "R":
-			// Refresh
+		case key.Matches(msg, a.keys.NewSession):
+			// Open new session dialog
+			a.showNewSession = true
+			a.newSessionFocus = 1 // Start on path field
+			a.newSessionName = ""
+			a.newSessionNameCursor = 0
+			a.newSessionPath = ""
+			a.newSessionPathCursor = 0
+			a.buildNewSessionPaths()
+			a.newSessionCursor = 0
+			// Default to selected session's path if available
+			if item := a.list.SelectedItem(); item != nil && !item.IsGroup() {
+				a.newSessionPath = a.shortenPath(item.Session.ProjectPath)
+				a.newSessionPathCursor = len(a.newSessionPath)
+			}
+			return a, nil
+
+		case msg.String() == "ctrl+r":
+			// Manual refresh
 			a.manager.Load()
 			if session.RefreshStatuses(a.manager.Sessions) {
 				a.manager.Save()
 			}
-			// Git info refreshes async via discovery tick
 			a.list.Refresh()
 			return a, a.setStatus("Refreshed")
 
@@ -868,7 +1065,7 @@ func (a *App) handleOpen() (tea.Model, tea.Cmd) {
 	}
 
 	// Open session in new terminal tab
-	windowID, err := terminal.OpenSession(item.Session.ProjectPath, item.Session.ClaudeSessionID, session.GetActiveWindowID(item.Session))
+	windowID, err := terminal.OpenSession(item.Session.ProjectPath, item.Session.ClaudeSessionID, session.GetActiveWindowID(item.Session), item.Session.Name)
 	if err != nil {
 		return a, a.setStatus("Error: " + err.Error())
 	}
@@ -1000,7 +1197,7 @@ func (a *App) View() string {
 	}
 
 	// Status bar - help on left, messages on right
-	helpText := "Enter:open  /,?:search  R:rename  K:kill  D:delete  P:pin  H:help  q:quit"
+	helpText := "Enter:open  /,?:search  R:rename  K:kill  P:pin  S:resume  H:help  Q:quit"
 	var statusLine string
 	if a.statusMsg != "" {
 		gap := a.width - len(helpText) - len(a.statusMsg) - 4
@@ -1041,8 +1238,81 @@ func (a *App) View() string {
 	if a.showTheme {
 		return a.renderThemeSelect()
 	}
+	if a.showNewSession {
+		return a.renderNewSessionDialog()
+	}
 
 	return view
+}
+
+// trackActiveSessions updates the list of active session IDs for resume
+func (a *App) trackActiveSessions() {
+	var activeIDs []string
+	for _, s := range a.manager.Sessions {
+		if s.Status != session.StatusIdle {
+			activeIDs = append(activeIDs, s.ClaudeSessionID)
+		}
+	}
+
+	// Compare with stored list to avoid unnecessary saves
+	stored := a.manager.GetLastActiveSessionIDs()
+	if !stringSliceEqual(activeIDs, stored) {
+		a.manager.SetLastActiveSessionIDs(activeIDs)
+		a.manager.Save()
+	}
+}
+
+// stringSliceEqual compares two string slices for equality
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// restoreSessions reopens previously active sessions if resume is enabled
+func (a *App) restoreSessions() tea.Cmd {
+	if !a.manager.GetResumeOnStartup() {
+		return nil
+	}
+
+	lastActive := a.manager.GetLastActiveSessionIDs()
+	if len(lastActive) == 0 {
+		return nil
+	}
+
+	// Build map for quick lookup by ClaudeSessionID
+	sessionMap := make(map[string]*session.Session)
+	for _, s := range a.manager.Sessions {
+		sessionMap[s.ClaudeSessionID] = s
+	}
+
+	var cmds []tea.Cmd
+	for _, id := range lastActive {
+		s := sessionMap[id]
+		if s == nil {
+			continue // Session was deleted
+		}
+		if s.Status != session.StatusIdle {
+			continue // Already active (has open tab)
+		}
+		// Capture session for closure
+		sess := s
+		cmds = append(cmds, func() tea.Msg {
+			terminal.OpenSession(sess.ProjectPath, sess.ClaudeSessionID, 0, sess.Name)
+			return nil
+		})
+	}
+
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // renderHelp renders a centered help screen
@@ -1052,14 +1322,14 @@ func (a *App) renderHelp() string {
 ├───────────────────────────────────────┤
 │  Navigation                           │
 │    ↑/↓      Move up/down              │
-│    ⇧↑/⇧↓    Move up/down fast (5x)    │
+│    ⇧↑/⇧↓    Move up/down fast         │
 │    ←/→      Collapse/expand group     │
 │    Tab      Switch panel focus        │
 │                                       │
 │  Actions (Shift + key)                │
 │    Enter    Open session in terminal  │
 │    G        Create new group          │
-│    N        New session (same folder) │
+│    N        New session (pick folder) │
 │    R        Rename session/group      │
 │    K        Kill session (close tab)  │
 │    D        Delete group              │
@@ -1074,10 +1344,12 @@ func (a *App) renderHelp() string {
 │    L        Toggle layout (|| / =)    │
 │    T        Select terminal emulator  │
 │    C        Select color theme        │
+│    S        Toggle resume on startup  │
 │                                       │
 │  Other                                │
+│    Ctrl+R   Refresh status/names      │
 │    H        Show this help            │
-│    q        Quit                      │
+│    Q        Quit                      │
 │                                       │
 │         Press any key to close        │
 ╰───────────────────────────────────────╯`
@@ -1114,7 +1386,7 @@ func (a *App) renderTerminalSelect() string {
 		"├─────────────────────────────┤\n" +
 		strings.Join(optionLines, "\n") + "\n" +
 		"│                             │\n" +
-		"│  j/k:navigate Enter:select  │\n" +
+		"│  ↑↓:navigate  Enter:select  │\n" +
 		"│         Esc:cancel          │\n" +
 		"╰─────────────────────────────╯"
 
@@ -1146,9 +1418,533 @@ func (a *App) renderThemeSelect() string {
 		"├─────────────────────────────┤\n" +
 		strings.Join(optionLines, "\n") + "\n" +
 		"│                             │\n" +
-		"│  j/k:navigate Enter:select  │\n" +
+		"│  ↑↓:navigate  Enter:select  │\n" +
 		"│         Esc:cancel          │\n" +
 		"╰─────────────────────────────╯"
 
 	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// buildNewSessionPaths builds the list of paths for the new session dialog
+func (a *App) buildNewSessionPaths() {
+	a.newSessionPaths = nil
+
+	// Add favorites first (starred)
+	favorites := a.manager.GetFavoritePaths()
+	for _, p := range favorites {
+		a.newSessionPaths = append(a.newSessionPaths, p)
+	}
+
+	// Add recent paths from sessions (excluding duplicates from favorites)
+	recentPaths := a.manager.GetUniqueProjectPaths()
+	favSet := make(map[string]bool)
+	for _, p := range favorites {
+		favSet[p] = true
+	}
+	for _, p := range recentPaths {
+		if !favSet[p] {
+			a.newSessionPaths = append(a.newSessionPaths, p)
+		}
+	}
+
+	// If no paths at all, add home directory
+	if len(a.newSessionPaths) == 0 {
+		home, _ := os.UserHomeDir()
+		a.newSessionPaths = append(a.newSessionPaths, home)
+	}
+}
+
+// updateNewSessionDialog handles input for the new session dialog
+func (a *App) updateNewSessionDialog(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return a, nil
+	}
+
+	switch keyMsg.String() {
+	case "esc":
+		a.showNewSession = false
+		return a, nil
+
+	case "enter":
+		// Use path from input or selected from list
+		path := a.newSessionPath
+		if path == "" && a.newSessionCursor >= 0 && a.newSessionCursor < len(a.newSessionPaths) {
+			path = a.newSessionPaths[a.newSessionCursor]
+		}
+		if path == "" {
+			return a, nil
+		}
+		path = a.expandPath(path)
+		if _, err := os.Stat(path); err != nil {
+			return a, a.setStatus("Path not found: " + path)
+		}
+		a.showNewSession = false
+
+		// Clear kitty_window_id from existing sessions to prevent path-matching
+		for _, s := range a.manager.Sessions {
+			if s.ProjectPath == path {
+				s.KittyWindowID = 0
+			}
+		}
+
+		// Get the session name (for tab title)
+		name := strings.TrimSpace(a.newSessionName)
+		if name != "" {
+			name = a.makeUniqueName(name)
+		}
+
+		// Open new session and get window ID
+		windowID, err := terminal.NewSession(path, name)
+		if err != nil {
+			return a, a.setStatus("Error: " + err.Error())
+		}
+
+		// Create a pending session immediately (before JSONL exists)
+		// This uses a temporary ID that will be updated when JSONL is created
+		if windowID > 0 {
+			pendingID := fmt.Sprintf("pending-%d", windowID)
+			now := time.Now()
+			pendingSession := &session.Session{
+				ID:              pendingID,
+				ClaudeSessionID: pendingID,
+				Name:            name,
+				ProjectPath:     path,
+				KittyWindowID:   windowID,
+				Status:          session.StatusWaiting,
+				Renamed:         name != "",
+				CreatedAt:       now,
+				LastAccessedAt:  now,
+			}
+			if name == "" {
+				pendingSession.Name = filepath.Base(path) + " (new)"
+			}
+			a.manager.Sessions = append(a.manager.Sessions, pendingSession)
+			a.manager.Save()
+		}
+
+		// Store pending state for when JSONL is created
+		a.pendingRenamePath = path
+		a.pendingRenameName = name
+		a.pendingRenameWindowID = windowID
+
+		a.list.Refresh()
+
+		if name != "" {
+			return a, a.setStatus("Created: " + name)
+		}
+		return a, a.setStatus("Opening new session in " + filepath.Base(path) + "...")
+
+	case "tab":
+		// Switch focus: name -> path -> list, with autocomplete on path
+		if a.newSessionFocus == 0 {
+			a.newSessionFocus = 1
+		} else if a.newSessionFocus == 1 {
+			// Try autocomplete first, if nothing changes move to list
+			oldPath := a.newSessionPath
+			a.autocompleteNewSessionPath()
+			if a.newSessionPath == oldPath && len(a.newSessionPaths) > 0 {
+				a.newSessionFocus = 2
+			}
+		} else {
+			a.newSessionFocus = 0
+		}
+		return a, nil
+
+	case "shift+tab":
+		// Reverse focus
+		if a.newSessionFocus == 0 {
+			if len(a.newSessionPaths) > 0 {
+				a.newSessionFocus = 2
+			} else {
+				a.newSessionFocus = 1
+			}
+		} else if a.newSessionFocus == 1 {
+			a.newSessionFocus = 0
+		} else {
+			a.newSessionFocus = 1
+		}
+		return a, nil
+
+	case "up":
+		if a.newSessionFocus == 0 {
+			// Already at top
+		} else if a.newSessionFocus == 1 {
+			a.newSessionFocus = 0
+		} else if a.newSessionFocus == 2 {
+			if a.newSessionCursor > 0 {
+				a.newSessionCursor--
+				// Update path field to match selection
+				a.newSessionPath = a.shortenPath(a.newSessionPaths[a.newSessionCursor])
+				a.newSessionPathCursor = len(a.newSessionPath)
+			} else {
+				a.newSessionFocus = 1
+			}
+		}
+		return a, nil
+
+	case "down":
+		if a.newSessionFocus == 0 {
+			a.newSessionFocus = 1
+		} else if a.newSessionFocus == 1 {
+			if len(a.newSessionPaths) > 0 {
+				a.newSessionFocus = 2
+				a.newSessionCursor = 0
+				// Update path field to match selection
+				a.newSessionPath = a.shortenPath(a.newSessionPaths[0])
+				a.newSessionPathCursor = len(a.newSessionPath)
+			}
+		} else if a.newSessionFocus == 2 {
+			if a.newSessionCursor < len(a.newSessionPaths)-1 {
+				a.newSessionCursor++
+				// Update path field to match selection
+				a.newSessionPath = a.shortenPath(a.newSessionPaths[a.newSessionCursor])
+				a.newSessionPathCursor = len(a.newSessionPath)
+			}
+		}
+		return a, nil
+
+	case "P":
+		// Toggle pin on selected path
+		if a.newSessionCursor >= 0 && a.newSessionCursor < len(a.newSessionPaths) {
+			path := a.newSessionPaths[a.newSessionCursor]
+			a.manager.ToggleFavoritePath(path)
+			oldPath := path
+			a.filterNewSessionPaths()
+			for i, p := range a.newSessionPaths {
+				if p == oldPath {
+					a.newSessionCursor = i
+					break
+				}
+			}
+		}
+		return a, nil
+
+	default:
+		// Handle text input based on focus
+		if a.newSessionFocus == 0 {
+			newText, newCursor, handled := handleTextInputKey(a.newSessionName, a.newSessionNameCursor, keyMsg.String())
+			if handled {
+				a.newSessionName = newText
+				a.newSessionNameCursor = newCursor
+			}
+		} else if a.newSessionFocus == 1 {
+			oldPath := a.newSessionPath
+			newText, newCursor, handled := handleTextInputKey(a.newSessionPath, a.newSessionPathCursor, keyMsg.String())
+			if handled {
+				a.newSessionPath = newText
+				a.newSessionPathCursor = newCursor
+				if newText != oldPath {
+					a.filterNewSessionPaths()
+				}
+			}
+		}
+		return a, nil
+	}
+}
+
+// expandPath expands ~ to home directory
+func (a *App) expandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, path[2:])
+	} else if path == "~" {
+		home, _ := os.UserHomeDir()
+		return home
+	}
+	return path
+}
+
+// filterNewSessionPaths filters the path list based on current input
+func (a *App) filterNewSessionPaths() {
+	a.buildNewSessionPaths()
+
+	if a.newSessionPath == "" {
+		return
+	}
+
+	input := strings.ToLower(a.newSessionPath)
+	expandedInput := a.expandPath(a.newSessionPath)
+
+	var filtered []string
+	for _, p := range a.newSessionPaths {
+		shortPath := a.shortenPath(p)
+		// Match if input is substring of path or shortened path
+		if strings.Contains(strings.ToLower(p), input) ||
+			strings.Contains(strings.ToLower(shortPath), input) ||
+			strings.HasPrefix(p, expandedInput) {
+			filtered = append(filtered, p)
+		}
+	}
+
+	// Also add filesystem completions if input looks like a path
+	if strings.HasPrefix(a.newSessionPath, "/") || strings.HasPrefix(a.newSessionPath, "~") {
+		fsCompletions := a.getPathCompletions(expandedInput)
+		for _, c := range fsCompletions {
+			// Add if not already in list
+			found := false
+			for _, p := range filtered {
+				if p == c {
+					found = true
+					break
+				}
+			}
+			if !found {
+				filtered = append(filtered, c)
+			}
+		}
+	}
+
+	a.newSessionPaths = filtered
+	if a.newSessionCursor >= len(filtered) {
+		a.newSessionCursor = max(0, len(filtered)-1)
+	}
+}
+
+// getPathCompletions returns directory completions for a path prefix
+func (a *App) getPathCompletions(prefix string) []string {
+	var completions []string
+
+	dir := filepath.Dir(prefix)
+	base := filepath.Base(prefix)
+
+	// If prefix ends with /, list that directory
+	if strings.HasSuffix(prefix, "/") || prefix == "" {
+		dir = prefix
+		base = ""
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return completions
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue // Skip hidden
+		}
+		if base == "" || strings.HasPrefix(strings.ToLower(name), strings.ToLower(base)) {
+			completions = append(completions, filepath.Join(dir, name))
+		}
+	}
+
+	// Limit to 5 completions
+	if len(completions) > 5 {
+		completions = completions[:5]
+	}
+
+	return completions
+}
+
+// autocompleteNewSessionPath completes the path input
+func (a *App) autocompleteNewSessionPath() {
+	if a.newSessionPath == "" {
+		// If no input but item selected, use that
+		if a.newSessionCursor >= 0 && a.newSessionCursor < len(a.newSessionPaths) {
+			a.newSessionPath = a.shortenPath(a.newSessionPaths[a.newSessionCursor])
+			a.newSessionPathCursor = len(a.newSessionPath)
+		}
+		return
+	}
+
+	expandedInput := a.expandPath(a.newSessionPath)
+	completions := a.getPathCompletions(expandedInput)
+
+	if len(completions) == 1 {
+		// Single match - complete to it
+		completed := a.shortenPath(completions[0])
+		a.newSessionPath = completed + "/"
+		a.newSessionPathCursor = len(a.newSessionPath)
+		a.filterNewSessionPaths()
+	} else if len(completions) > 1 {
+		// Multiple matches - complete to common prefix
+		common := completions[0]
+		for _, c := range completions[1:] {
+			common = commonPrefix(common, c)
+		}
+		if len(common) > len(expandedInput) {
+			a.newSessionPath = a.shortenPath(common)
+			a.newSessionPathCursor = len(a.newSessionPath)
+			a.filterNewSessionPaths()
+		}
+	}
+}
+
+// commonPrefix returns the common prefix of two strings
+func commonPrefix(a, b string) string {
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	for i := 0; i < minLen; i++ {
+		if a[i] != b[i] {
+			return a[:i]
+		}
+	}
+	return a[:minLen]
+}
+
+// renderNewSessionDialog renders the new session path selection dialog
+func (a *App) renderNewSessionDialog() string {
+	innerWidth := 56
+
+	// Build the box
+	hLine := strings.Repeat("─", innerWidth)
+
+	var lines []string
+	lines = append(lines, "╭"+hLine+"╮")
+
+	// Title
+	title := "New Claude Session"
+	titlePad := (innerWidth - len(title)) / 2
+	lines = append(lines, "│"+strings.Repeat(" ", titlePad)+title+strings.Repeat(" ", innerWidth-titlePad-len(title))+"│")
+	lines = append(lines, "├"+hLine+"┤")
+
+	// Name field
+	nameLabel := "  Name: "
+	nameFocused := a.newSessionFocus == 0
+	nameText := a.newSessionName
+	if nameFocused {
+		if a.newSessionNameCursor <= len(nameText) {
+			nameText = nameText[:a.newSessionNameCursor] + "_" + nameText[a.newSessionNameCursor:]
+		}
+	}
+	if nameText == "" && !nameFocused {
+		nameText = "(optional)"
+	}
+	nameContent := nameLabel + nameText
+	if len(nameContent) > innerWidth {
+		nameContent = nameContent[:innerWidth]
+	}
+	nameContent = nameContent + strings.Repeat(" ", innerWidth-len(nameContent))
+	if nameFocused {
+		nameContent = selectedItemStyle.Render(nameContent)
+	}
+	lines = append(lines, "│"+nameContent+"│")
+
+	// Path field
+	pathLabel := "  Path: "
+	pathFocused := a.newSessionFocus == 1
+	pathText := a.newSessionPath
+	if pathFocused {
+		if a.newSessionPathCursor <= len(pathText) {
+			pathText = pathText[:a.newSessionPathCursor] + "_" + pathText[a.newSessionPathCursor:]
+		}
+	}
+	pathContent := pathLabel + pathText
+	if len(pathContent) > innerWidth {
+		pathContent = pathContent[:innerWidth]
+	}
+	pathContent = pathContent + strings.Repeat(" ", innerWidth-len(pathContent))
+	if pathFocused {
+		pathContent = selectedItemStyle.Render(pathContent)
+	}
+	lines = append(lines, "│"+pathContent+"│")
+
+	// Separator before path list
+	lines = append(lines, "├"+hLine+"┤")
+
+	// Build favorite set
+	favorites := a.manager.GetFavoritePaths()
+	favSet := make(map[string]bool)
+	for _, p := range favorites {
+		favSet[p] = true
+	}
+
+	// Path list
+	maxVisible := 8
+	startIdx := 0
+	if a.newSessionCursor >= maxVisible {
+		startIdx = a.newSessionCursor - maxVisible + 1
+	}
+
+	listFocused := a.newSessionFocus == 2
+	for i := startIdx; i < len(a.newSessionPaths) && i < startIdx+maxVisible; i++ {
+		path := a.newSessionPaths[i]
+		displayPath := a.shortenPath(path)
+		isFav := favSet[path]
+		isSelected := i == a.newSessionCursor
+
+		// Truncate path if needed
+		maxPathDisplay := innerWidth - 6
+		if len(displayPath) > maxPathDisplay {
+			displayPath = displayPath[:maxPathDisplay-2] + ".."
+		}
+
+		// Build the line content
+		cursor := "  "
+		if isSelected && listFocused {
+			cursor = "> "
+		}
+		star := "  "
+		if isFav {
+			star = "✦ "
+		}
+
+		content := cursor + star + displayPath
+		padLen := innerWidth - 4 - len(displayPath)
+		if padLen > 0 {
+			content += strings.Repeat(" ", padLen)
+		}
+
+		// Apply highlight style if selected
+		if isSelected {
+			content = selectedItemStyle.Render(content)
+		}
+		lines = append(lines, "│"+content+"│")
+	}
+
+	// Fill empty slots if list is short
+	for i := len(a.newSessionPaths); i < maxVisible; i++ {
+		lines = append(lines, "│"+strings.Repeat(" ", innerWidth)+"│")
+	}
+
+	// Help line
+	lines = append(lines, "├"+hLine+"┤")
+	helpLine := "Tab:next  P:pin  Enter:create  Esc:cancel"
+	helpPad := (innerWidth - len(helpLine)) / 2
+	lines = append(lines, "│"+strings.Repeat(" ", helpPad)+helpLine+strings.Repeat(" ", innerWidth-helpPad-len(helpLine))+"│")
+
+	lines = append(lines, "╰"+hLine+"╯")
+
+	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
+}
+
+// shortenPath shortens a path for display, replacing home dir with ~
+func (a *App) shortenPath(path string) string {
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(path, home) {
+		return "~" + path[len(home):]
+	}
+	return path
+}
+
+// makeUniqueName returns a unique session name by appending (1), (2), etc. if needed
+func (a *App) makeUniqueName(name string) string {
+	// Check if name already exists
+	exists := func(n string) bool {
+		for _, s := range a.manager.Sessions {
+			if s.Name == n {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !exists(name) {
+		return name
+	}
+
+	// Try adding suffix
+	for i := 1; i <= 100; i++ {
+		candidate := fmt.Sprintf("%s (%d)", name, i)
+		if !exists(candidate) {
+			return candidate
+		}
+	}
+	return name
 }

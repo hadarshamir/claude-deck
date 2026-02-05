@@ -113,7 +113,8 @@ func isAppRunning(appName string) bool {
 
 // OpenSession opens a Claude session in a new terminal tab, or focuses existing tab
 // Returns the kitty window ID if opened in kitty (0 otherwise)
-func OpenSession(projectPath, sessionID string, activeWindowID int) (int, error) {
+// tabTitle is optional - if provided, sets the kitty tab title
+func OpenSession(projectPath, sessionID string, activeWindowID int, tabTitle string) (int, error) {
 	terminal := GetEffectiveTerminal()
 
 	// If session already has an active tab, focus it instead of opening new one
@@ -133,7 +134,7 @@ func OpenSession(projectPath, sessionID string, activeWindowID int) (int, error)
 	case TerminalGhostty:
 		return 0, openInGhostty(claudeCmd, projectPath)
 	case TerminalKitty:
-		return openInKittyWithID(claudeCmd, projectPath)
+		return openInKittyWithID(claudeCmd, projectPath, tabTitle)
 	default:
 		return 0, openInAppleTerminal(claudeCmd)
 	}
@@ -155,9 +156,14 @@ func CloseKittyWindow(windowID int) error {
 }
 
 // openInKittyWithID opens a new tab in Kitty and returns the window ID
-func openInKittyWithID(command string, workDir string) (int, error) {
+func openInKittyWithID(command string, workDir string, tabTitle string) (int, error) {
 	wrappedCmd := fmt.Sprintf("%s; exec zsh", command)
-	cmd := exec.Command("kitty", "@", "launch", "--type=tab", "--cwd", workDir, "zsh", "-i", "-c", wrappedCmd)
+	args := []string{"@", "launch", "--type=tab", "--cwd", workDir}
+	if tabTitle != "" {
+		args = append(args, "--tab-title", tabTitle)
+	}
+	args = append(args, "zsh", "-i", "-c", wrappedCmd)
+	cmd := exec.Command("kitty", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		// Fallback to AppleScript (no window ID available)
@@ -167,6 +173,15 @@ func openInKittyWithID(command string, workDir string) (int, error) {
 	var windowID int
 	fmt.Sscanf(strings.TrimSpace(string(output)), "%d", &windowID)
 	return windowID, nil
+}
+
+// SetKittyTabTitle renames a kitty tab by window ID
+func SetKittyTabTitle(windowID int, title string) error {
+	if windowID <= 0 || title == "" {
+		return nil
+	}
+	cmd := exec.Command("kitty", "@", "set-tab-title", "--match", fmt.Sprintf("id:%d", windowID), title)
+	return cmd.Run()
 }
 
 // openInITerm2 opens a new tab in iTerm2
@@ -211,23 +226,6 @@ tell application "System Events"
 end tell
 `
 	return runAppleScript(script)
-}
-
-// openInKitty opens a new tab in Kitty terminal
-func openInKitty(command string, workDir string) error {
-	// Wrap command to keep tab open after command exits: zsh -i -c 'command; exec zsh'
-	wrappedCmd := fmt.Sprintf("%s; exec zsh", command)
-
-	// Use kitty's remote control to open a new tab
-	// This requires allow_remote_control to be enabled in kitty.conf
-	cmd := exec.Command("kitty", "@", "launch", "--type=tab", "--cwd", workDir, "zsh", "-i", "-c", wrappedCmd)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Fallback: try using AppleScript if remote control is disabled
-		return openInKittyAppleScript(command)
-	}
-	_ = output
-	return nil
 }
 
 // openInKittyAppleScript opens a new tab in Kitty using AppleScript (fallback)
@@ -286,7 +284,9 @@ func runAppleScript(script string) error {
 }
 
 // NewSession opens a new Claude session in a new terminal tab
-func NewSession(projectPath string) error {
+// tabTitle is optional - if provided, sets the kitty tab title
+// Returns the kitty window ID if opened in kitty (0 otherwise)
+func NewSession(projectPath string, tabTitle string) (int, error) {
 	terminal := GetEffectiveTerminal()
 
 	// Build the command to run
@@ -294,12 +294,12 @@ func NewSession(projectPath string) error {
 
 	switch terminal {
 	case TerminalITerm2:
-		return openInITerm2(claudeCmd)
+		return 0, openInITerm2(claudeCmd)
 	case TerminalGhostty:
-		return openInGhostty(claudeCmd, projectPath)
+		return 0, openInGhostty(claudeCmd, projectPath)
 	case TerminalKitty:
-		return openInKitty(claudeCmd, projectPath)
+		return openInKittyWithID(claudeCmd, projectPath, tabTitle)
 	default:
-		return openInAppleTerminal(claudeCmd)
+		return 0, openInAppleTerminal(claudeCmd)
 	}
 }

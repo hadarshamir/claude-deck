@@ -193,7 +193,7 @@ func (m *DialogModel) Update(msg tea.Msg) (*DialogModel, tea.Cmd) {
 			}
 			return m, nil
 
-		case "up", "k":
+		case "up":
 			if m.dialogType == DialogMove && m.groupCursor > 0 {
 				m.groupCursor--
 			}
@@ -202,7 +202,7 @@ func (m *DialogModel) Update(msg tea.Msg) (*DialogModel, tea.Cmd) {
 			}
 			return m, nil
 
-		case "down", "j":
+		case "down":
 			if m.dialogType == DialogMove && m.groupCursor < len(m.groups)-1 {
 				m.groupCursor++
 			}
