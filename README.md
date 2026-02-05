@@ -1,56 +1,82 @@
 # Claude Deck
 
-A TUI application for managing Claude Code sessions. Discover, organize, and quickly resume your Claude Code conversations.
+A TUI session manager for Claude Code. Discover, organize, and quickly resume your Claude Code conversations.
+
+![Claude Deck](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)
 
 ## Features
 
-- **Session Discovery**: Automatically finds sessions from `~/.claude/projects`
-- **Organization**: Group sessions into folders, rename, and reorder
-- **Quick Resume**: Open sessions in new terminal tabs (iTerm2, Ghostty, Terminal.app)
-- **Live Preview**: See recent conversation messages with live updates
-- **Status Detection**: Shows if sessions are running, waiting, or idle
-- **Fuzzy Search**: Quickly find sessions with `/`
+- **Session Discovery** - Automatically finds all sessions from `~/.claude/projects`
+- **Live Status** - Shows running/waiting/idle status via Kitty window tracking
+- **Tab Name Sync** - Session names sync from Claude's tab titles automatically
+- **Organization** - Groups, pinning, renaming, and custom ordering
+- **Quick Resume** - Open sessions in new terminal tabs with `--resume`
+- **Live Preview** - See conversation messages with real-time updates
+- **Search** - Fuzzy search by name (`/`) or search within content (`?`)
+- **Multi-Terminal** - Supports Kitty, iTerm2, Ghostty, and Terminal.app
 
 ## Installation
 
 ```bash
-# Install Go if not installed
-brew install go
+go install github.com/hadarshamir/claude-deck/cmd/claude-deck@latest
+```
 
-# Clone and build
-cd ~/Projects/claude-deck
-make build
+Or build from source:
 
-# Install to ~/bin
-make install
+```bash
+git clone https://github.com/hadarshamir/claude-deck.git
+cd claude-deck
+make install  # Installs to ~/bin/
 ```
 
 ## Usage
 
 ```bash
-claude-deck
+deck
 ```
 
 ### Key Bindings
 
+**Navigation**
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `g` | Go to top |
-| `G` | Go to bottom |
-| `h` / `←` | Collapse group |
-| `l` / `→` | Expand group |
-| `Enter` | Open session in new tab |
-| `n` | New session (same project) |
-| `/` | Search sessions |
-| `r` | Rename session/group |
-| `d` | Delete session/group |
-| `m` | Move session to group |
-| `N` | Create new group |
-| `R` | Refresh list |
-| `?` | Show help |
-| `q` | Quit |
+| `↑` / `↓` | Move up/down |
+| `Shift+↑` / `Shift+↓` | Move up/down fast |
+| `←` / `→` | Collapse/expand group |
+| `Tab` | Switch panel focus |
+
+**Actions** (Shift + key)
+| Key | Action |
+|-----|--------|
+| `Enter` | Open session in terminal |
+| `N` | New session (pick folder) |
+| `G` | Create new group |
+| `R` | Rename session/group |
+| `K` | Kill session (close tab) |
+| `D` | Delete group |
+| `M` | Move session to group |
+| `P` | Pin/unpin session |
+
+**Search**
+| Key | Action |
+|-----|--------|
+| `/` | Search by name |
+| `?` | Search in content |
+
+**Settings**
+| Key | Action |
+|-----|--------|
+| `L` | Toggle layout (side-by-side / stacked) |
+| `T` | Select terminal emulator |
+| `C` | Select color theme |
+| `S` | Toggle resume on startup |
+
+**Other**
+| Key | Action |
+|-----|--------|
+| `Ctrl+R` | Refresh status and names |
+| `H` | Show help |
+| `Q` | Quit |
 
 ## How It Works
 
@@ -58,48 +84,48 @@ claude-deck
 
 Sessions are discovered from Claude Code's data directory:
 - Location: `~/.claude/projects/<encoded-path>/*.jsonl`
-- Directory names are encoded paths (e.g., `-Users-hadar-project`)
 - Each `.jsonl` file is a session with UUID filename
-
-### Metadata Storage
-
-Custom metadata (names, groups, order) is stored separately:
-- Location: `~/.claude-sessions/sessions.json`
-- Claude's original data is never modified
+- Project path is read from the `cwd` field in JSONL
 
 ### Status Detection
 
-Session status is determined by:
-1. Process detection: `pgrep -f "claude.*<project-path>"`
-2. CPU usage: High CPU = running, low CPU = waiting
-3. Fallback: File modification time
+Session status is event-driven (no polling):
+- **fsnotify** watches for JSONL file changes
+- **Kitty** window IDs track which tab belongs to which session
+- **Spinner detection** - Claude's tab title spinner indicates active work
 
-### Terminal Integration
+Status states:
+- 🟢 **Running** - Claude is actively working (spinner in tab title)
+- 🟡 **Waiting** - Tab is open, waiting for input
+- ⚫ **Idle** - No open tab
 
-Sessions open in new terminal tabs via AppleScript:
-- Supports iTerm2, Ghostty, and Terminal.app
-- Auto-detects current terminal
-- Runs: `cd <project> && claude --resume <session-id>`
+### Tab Name Sync
+
+Session names automatically sync from Claude's tab titles:
+- Strong matches via `--resume` flag or stored window ID
+- Names sync on file changes and on startup
+- User renames are preserved (won't be overwritten)
+
+### Metadata Storage
+
+Custom metadata is stored separately from Claude's data:
+- Location: `~/.claude-sessions/sessions.json`
+- Stores: names, groups, pins, window IDs, settings
+- Claude's original data is never modified
 
 ## Development
 
 ```bash
-# Run during development
-make run
-
-# Format code
-make fmt
-
-# Run tests
-make test
-
-# Build optimized release binary
-make release
+make build    # Build to ./bin/claude-deck
+make run      # Build and run
+make test     # Run tests
+make fmt      # Format code
+make lint     # Run golangci-lint
+make release  # Optimized release build
 ```
 
 ## Dependencies
 
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea) - TUI framework
-- [Bubbles](https://github.com/charmbracelet/bubbles) - TUI components
 - [Lip Gloss](https://github.com/charmbracelet/lipgloss) - Styling
 - [fsnotify](https://github.com/fsnotify/fsnotify) - File watching
