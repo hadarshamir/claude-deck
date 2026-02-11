@@ -172,7 +172,7 @@ func ApplyStatusUpdates(sessions []*Session, updates []StatusUpdate) (bool, bool
 				s.Status = u.Status
 				changed = true
 			}
-			if u.Name != "" && s.Name != u.Name {
+			if u.Name != "" && s.Name != u.Name && !s.Renamed {
 				s.Name = u.Name
 				changed = true
 				needsSave = true
@@ -237,13 +237,20 @@ func ClaimWindowID(sessions []*Session, claimingSession *Session, windowID int) 
 
 // GetActiveWindowID returns the kitty window ID for a session if it has an active tab
 // Returns 0 if no active tab found
+// Only uses strong matching (stored window ID or --resume session ID) to avoid
+// incorrectly matching a different session that shares the same project path.
 func GetActiveWindowID(s *Session) int {
 	// First check if we have a stored window ID
 	if s.KittyWindowID > 0 {
-		// Verify it's still active
+		// Verify it's still active and still belongs to this session
 		activeSessions := getKittyActiveSessions()
 		for _, active := range activeSessions {
 			if active.windowID == s.KittyWindowID {
+				// If the tab has a --resume flag for a different session, our stored ID is stale
+				if active.sessionID != "" && active.sessionID != s.ClaudeSessionID {
+					s.KittyWindowID = 0
+					break
+				}
 				return s.KittyWindowID
 			}
 		}
@@ -253,25 +260,15 @@ func GetActiveWindowID(s *Session) int {
 
 	activeSessions := getKittyActiveSessions()
 
-	// Check for session ID match
+	// Check for session ID match (--resume flag)
 	for _, active := range activeSessions {
 		if active.sessionID != "" && active.sessionID == s.ClaudeSessionID {
 			return active.windowID
 		}
 	}
 
-	// Check for project path match (less reliable)
-	for _, active := range activeSessions {
-		if active.sessionID != "" {
-			continue
-		}
-		pathMatch := active.projectPath == s.ProjectPath ||
-			strings.HasPrefix(active.projectPath, s.ProjectPath+"/")
-		if pathMatch {
-			return active.windowID
-		}
-	}
-
+	// Do NOT fall back to project path matching here — that could match
+	// a different session's tab that happens to be in the same directory.
 	return 0
 }
 
