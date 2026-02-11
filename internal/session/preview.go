@@ -140,6 +140,12 @@ func GetPreview(s *Session) ([]PreviewMessage, error) {
 			continue
 		}
 
+		// Truncate all messages to prevent rendering issues with very long content
+		// (e.g. context continuation summaries can be 18K+ chars)
+		if len(msg.Content) > MaxContentLength {
+			msg.Content = msg.Content[:MaxContentLength] + "..."
+		}
+
 		messages = append(messages, msg)
 	}
 

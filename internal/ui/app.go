@@ -1083,8 +1083,10 @@ func (a *App) updateLayout() {
 		a.contentHeight = contentHeight
 		a.listStartY = 2
 
-		a.list.SetSize(a.listWidth-2, contentHeight-2)
-		a.preview.SetSize(a.previewWidth-2, contentHeight-2)
+		// Content width = panel Width - padding(2). Panel Width = allocated - border(2).
+		// So content = allocated - 4. Height = panel Height - border(2).
+		a.list.SetSize(a.listWidth-4, contentHeight-2)
+		a.preview.SetSize(a.previewWidth-4, contentHeight-2)
 	} else {
 		// Stacked layout - list on top, preview below
 		listH := contentHeight * 35 / 100
@@ -1094,8 +1096,8 @@ func (a *App) updateLayout() {
 		a.contentHeight = listH
 		a.listStartY = 2
 
-		a.list.SetSize(a.listWidth, listH-2)
-		a.preview.SetSize(a.previewWidth, previewH-2)
+		a.list.SetSize(a.listWidth-2, listH-2)
+		a.preview.SetSize(a.previewWidth-2, previewH-2)
 	}
 }
 
@@ -1122,9 +1124,8 @@ func (a *App) View() string {
 		return titleStyle.Render("Claude Deck") + "\n\n  Error: " + a.err.Error()
 	}
 
-	// Header with session count
-	sessionCount := len(a.manager.Sessions)
-	header := titleStyle.Render("Claude Deck") + "  " + helpStyle.Render(fmt.Sprintf("(%d sessions)", sessionCount))
+	// Header
+	header := titleStyle.Render("Claude Deck")
 	headerPadded := header + strings.Repeat(" ", max(0, a.width-lipgloss.Width(header)))
 
 	// Render panel contents
@@ -1214,7 +1215,28 @@ func (a *App) View() string {
 		return a.renderNewSessionDialog()
 	}
 
-	return view
+	// Normalize output to exactly a.height lines to prevent diff-based rendering artifacts.
+	// lipgloss panel wrapping can cause inconsistent line counts between frames.
+	return a.normalizeOutput(view)
+}
+
+// normalizeOutput ensures the view has exactly a.height lines, each padded to a.width.
+// This prevents Bubble Tea's diff-based renderer from producing ghost content
+// when panel heights vary between frames due to lipgloss wrapping behavior.
+func (a *App) normalizeOutput(view string) string {
+	lines := strings.Split(view, "\n")
+	result := make([]string, a.height)
+	for i := 0; i < a.height; i++ {
+		if i < len(lines) {
+			result[i] = lines[i]
+		}
+		// Pad each line to full terminal width
+		w := lipgloss.Width(result[i])
+		if w < a.width {
+			result[i] += strings.Repeat(" ", a.width-w)
+		}
+	}
+	return strings.Join(result, "\n")
 }
 
 // trackActiveSessions updates the list of active session IDs for resume

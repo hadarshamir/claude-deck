@@ -251,11 +251,31 @@ func truncateString(s string, maxLen int) string {
 	if maxLen <= 0 {
 		return ""
 	}
-	runes := []rune(s)
-	if len(runes) <= maxLen {
+	// Use visible width (excludes ANSI codes) to avoid breaking escape sequences
+	if lipgloss.Width(s) <= maxLen {
 		return s
 	}
-	return string(runes[:maxLen])
+	// Strip ANSI codes, truncate the plain text, then re-render won't help,
+	// so just take a safe prefix by visible char count
+	visible := 0
+	inEscape := false
+	for i, r := range s {
+		if r == '\x1b' {
+			inEscape = true
+			continue
+		}
+		if inEscape {
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+		visible++
+		if visible >= maxLen {
+			return s[:i+len(string(r))]
+		}
+	}
+	return s
 }
 
 // renderMessages renders just the messages section (for scrolling)
@@ -301,6 +321,11 @@ func (m *PreviewModel) renderHeader() string {
 	// Git branch (from Claude's JSONL - branch at time of session)
 	if m.session.GitBranch != "" {
 		lines = append(lines, previewMetaStyle.Render("Branch: ")+helpStyle.Render(m.session.GitBranch))
+	}
+
+	// Session ID
+	if m.session.ClaudeSessionID != "" {
+		lines = append(lines, previewMetaStyle.Render("Session: ")+helpStyle.Render(m.session.ClaudeSessionID))
 	}
 
 	// Timestamps
@@ -362,6 +387,15 @@ func wrapText(text string, maxWidth int) string {
 
 		var currentLine string
 		for _, word := range words {
+			// Break words longer than maxWidth
+			for len(word) > maxWidth {
+				if currentLine != "" {
+					lines = append(lines, currentLine)
+					currentLine = ""
+				}
+				lines = append(lines, word[:maxWidth])
+				word = word[maxWidth:]
+			}
 			if currentLine == "" {
 				currentLine = word
 			} else if len(currentLine)+1+len(word) <= maxWidth {

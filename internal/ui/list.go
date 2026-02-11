@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -17,6 +18,7 @@ type ListItem struct {
 	Indent       int
 	Filtered     bool
 	IsLastInTree bool // true if this is the last child in a group (use └ instead of ├)
+	ChildCount   int  // number of sessions in this group (only set for group items)
 }
 
 func (i ListItem) IsGroup() bool {
@@ -142,7 +144,7 @@ func (m *ListModel) buildItems() {
 			Path:     "__active__",
 			Expanded: m.activeExpanded,
 		}
-		m.items = append(m.items, ListItem{Group: activeGroup, Indent: 0})
+		m.items = append(m.items, ListItem{Group: activeGroup, Indent: 0, ChildCount: len(activeSessions)})
 		if m.activeExpanded {
 			for i, s := range activeSessions {
 				isLast := i == len(activeSessions)-1
@@ -159,7 +161,7 @@ func (m *ListModel) buildItems() {
 			Path:     "__inactive__",
 			Expanded: m.inactiveExpanded,
 		}
-		m.items = append(m.items, ListItem{Group: inactiveGroup, Indent: 0})
+		m.items = append(m.items, ListItem{Group: inactiveGroup, Indent: 0, ChildCount: len(inactiveSessions)})
 		if m.inactiveExpanded {
 			for i, s := range inactiveSessions {
 				isLast := i == len(inactiveSessions)-1
@@ -170,10 +172,10 @@ func (m *ListModel) buildItems() {
 
 	// Add user-created groups (always show, even if empty)
 	for _, g := range m.manager.Groups {
-		m.items = append(m.items, ListItem{Group: g, Indent: 0})
+		sessionsInGroup := m.manager.SessionsInGroup(g.Path)
+		m.items = append(m.items, ListItem{Group: g, Indent: 0, ChildCount: len(sessionsInGroup)})
 
 		if g.Expanded {
-			sessionsInGroup := m.manager.SessionsInGroup(g.Path)
 			for i, s := range sessionsInGroup {
 				isLast := i == len(sessionsInGroup)-1
 				m.items = append(m.items, ListItem{Session: s, Indent: 1, IsLastInTree: isLast})
@@ -809,6 +811,15 @@ func (m *ListModel) View() string {
 		}
 	}
 
+	// Normalize line widths for consistent terminal rendering
+	// (prevents ghost content from stale diff when scrolling)
+	for i := range lines {
+		w := lipgloss.Width(lines[i])
+		if w < m.width {
+			lines[i] += strings.Repeat(" ", m.width-w)
+		}
+	}
+
 	// Add search line at bottom (always at same position)
 	if m.searching || m.contentSearching {
 		var prefix, query string
@@ -855,6 +866,7 @@ func (m *ListModel) renderRow(item ListItem, selected, hovered bool, nameW, date
 		if item.Group.Expanded {
 			arrow = "▼"
 		}
+
 		name := truncate(item.Group.Name, nameW)
 
 		var row string
@@ -863,14 +875,14 @@ func (m *ListModel) renderRow(item ListItem, selected, hovered bool, nameW, date
 			nameWithCursor := m.renameInput[:m.renameCursor] + "_" + m.renameInput[m.renameCursor:]
 			row = " " + arrow + " " + padStr(nameWithCursor, nameW)
 		} else if selected && m.deleting {
-			// Show delete confirmation for group - X replaces arrow
 			prompt := "Delete group? (y/n)"
 			row = " X " + padStr(prompt, nameW)
+		} else if item.Group.Expanded {
+			row = " " + arrow + " " + name + " " + helpStyle.Render(fmt.Sprintf("(%d)", item.ChildCount))
 		} else {
 			row = " " + arrow + " " + name
 		}
 
-		// Apply style to entire row
 		if selected {
 			return selectedGroupStyle.Width(totalWidth).Render(row)
 		}
